@@ -1,0 +1,24 @@
+%% file: docs/diagrams/packet_flow.mmd
+flowchart LR
+
+%% Packet enters from NIC
+    NIC["NIC Driver (RX)"] --> INGRESS["Ingress Selector"]
+
+%% Goes into queue
+    INGRESS -->|"enqueue()"| SPSC["SPSC Queue<br/>(bounded, preallocated)"]
+
+%% Routing logic consumes
+    SPSC -->|"dequeue()"| PS["Path Selection"]
+    PS --> QoS["QoS Policy"]
+    QoS --> FAIL["Failover / Multipath"]
+
+%% Consults routing table
+    PS --> RIB["RIB (routing table)"]
+
+%% Packet leaves
+    FAIL -->|"TX"| EGRESS["NIC Driver (TX)"]
+
+%% Memory flow
+    PS -. alloc/free .-> POOL["PacketPool<br/>(fixed-capacity)"]
+    QoS -. read .-> POOL
+    FAIL -. read .-> POOL

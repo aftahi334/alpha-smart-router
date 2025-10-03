@@ -1,0 +1,99 @@
+# ======================================================================
+# Alpha Smart Router — Example Services/PoPs Config (TOML)
+# File: config/services.example.toml
+#
+# PURPOSE
+#   Defines Anycast-like services and the Points of Presence (PoPs)
+#   that can serve them. Your IngressSelector can load this and pick
+#   an ingress PoP; your latency-aware selector handles the backbone.
+#
+# NOTES
+#   - Keep IDs short and stable (e.g., "NYC", "CHI", "SFO").
+#   - IPs here are placeholders; in Option B (FRR lab), set them to
+#     the loopback/service IPs advertised by each PoP.
+#   - You can add/remove fields as your code evolves.
+# ======================================================================
+
+[defaults]
+# Probe & smoothing defaults (used by your prober/metrics module later).
+probe_interval_ms = 500
+rtt_ewma_alpha    = 0.2
+loss_ewma_alpha   = 0.2
+
+[health_thresholds]
+# Simple health gating; your selector can use these to mark paths Healthy/Degraded/Down.
+warn_rtt_ms        = 80
+degraded_rtt_ms    = 120
+max_loss_percent   = 5
+down_after_misses  = 3
+hysteresis_ms      = 2000
+
+# ----------------------------------------------------------------------
+# Points of Presence (PoPs)
+# ----------------------------------------------------------------------
+# Each [[pops]] entry describes an ingress location capable of serving
+# one or more services. "ip" should be reachable in your lab or sim.
+# "probe_target" is where ping_tool or prober will send probes.
+
+[[pops]]
+id           = "NYC"
+region       = "us-east"
+ip           = "10.10.0.1"
+probe_target = "10.10.0.1"
+weight       = 1
+enabled      = true
+
+[[pops]]
+id           = "CHI"
+region       = "us-central"
+ip           = "10.20.0.1"
+probe_target = "10.20.0.1"
+weight       = 1
+enabled      = true
+
+[[pops]]
+id           = "SFO"
+region       = "us-west"
+ip           = "10.30.0.1"
+probe_target = "10.30.0.1"
+weight       = 1
+enabled      = true
+
+# ----------------------------------------------------------------------
+# Services
+# ----------------------------------------------------------------------
+# Each [[services]] entry defines a logical Anycasted service and the
+# list of PoP IDs allowed to serve it.
+
+[[services]]
+id          = "web"
+description = "Public web front door"
+pops        = ["NYC", "CHI", "SFO"]
+
+[[services]]
+id          = "api"
+description = "Internal API gateway"
+pops        = ["NYC", "SFO"]
+
+[[services]]
+id          = "metrics"
+description = "Telemetry/observability endpoint"
+pops        = ["CHI"]
+
+# ----------------------------------------------------------------------
+# Optional policy hints (non-binding; your code can read/ignore)
+# ----------------------------------------------------------------------
+
+[policy.latency]
+# Prefer lowest RTT; fall back to next healthy PoP if above degraded_rtt_ms
+prefer = "lowest_rtt"
+
+[policy.qos]
+# Map traffic classes to preferences (future QoS module can use this).
+# e.g., "Voice" prefers lowest jitter, "Bulk" prefers highest throughput.
+class_preferences = ["Voice=low_jitter", "Video=low_jitter", "Bulk=throughput", "BestEffort=balanced"]
+
+[policy.failover]
+# How aggressively to fail over between PoPs when health degrades.
+mode = "fast"      # options: "conservative" | "balanced" | "fast"
+cooldown_ms = 3000

@@ -1,0 +1,43 @@
+%% file: docs/diagrams/mem_overview.mmd
+%% Mermaid v10+ compatible, safe for mmdc
+
+flowchart LR
+
+%% ================== MEMORY PRIMITIVES ==================
+    subgraph Mem["alpha::mem — Primitives"]
+        direction TB
+        POOL["PacketPool<br/>(fixed-capacity, preallocated)"]
+        SPSC["SPSC Queue<br/>(single-producer, single-consumer, bounded)"]
+    end
+
+%% ================== THREADS ==================
+    subgraph Producer["Producer Thread (Ingress)"]
+        P0["RX loop:<br/>read NIC → fill Packet"]
+    end
+
+    subgraph Consumer["Consumer Thread (Routing/Egress)"]
+        C0["Process:<br/>Path Selection → QoS → Failover"]
+    end
+
+%% ================== LIFECYCLE ==================
+%% Startup preallocation
+    START["Startup"] -->|"allocate N packets"| POOL
+
+%% Producer path
+    P0 -->|"acquire() from pool"| POOL
+    POOL -->|"PacketHandle"| P0
+    P0 -->|"enqueue(PacketHandle)"| SPSC
+
+%% Consumer path
+    SPSC -->|"dequeue()"| C0
+    C0 -->|"release() to pool"| POOL
+
+%% Notes / guarantees
+    NOTE1["Guarantees:<br/>• No dynamic allocation after startup<br/>• Bounded memory & backpressure via SPSC<br/>• Zero-copy handles (pool-managed)<br/>• Cache-friendly contiguous slabs"]:::note
+
+%% Optional stalls/backpressure (dotted)
+    P0 -. "if full → drop/backoff" .-> SPSC
+    C0 -. "if empty → wait/yield" .-> SPSC
+
+%% ================== STYLES ==================
+    classDef note fill:#f6f6f6,stroke:#bbb,stroke-width:1px;

@@ -1,0 +1,59 @@
+# =====================================================================
+# Alpha Smart Router — Option B Lab (Placeholder Topology)
+# File: lab/containerlab.topo.yaml
+#
+# PURPOSE
+#   Minimal scaffold for a Containerlab demo:
+#     - 1 client
+#     - 2 FRR PoPs (advertise the same /32 anycast prefix)
+#     - 1 alpha node (your router app host)
+#
+# STATUS
+#   Placeholder only. IPs, ASNs, and neighbors are TODO.
+# =====================================================================
+
+name: alpha-anycast-demo
+
+topology:
+  nodes:
+    client:
+      kind: linux
+      image: alpine:3
+      # TODO: add startup-cmd to install ping/traceroute if desired
+
+    alpha:
+      kind: linux
+      image: alpine:3
+      # TODO: mount your built router binary; e.g.:
+      # binds:
+      #   - ../build/Release/apps/router_app/router_app:/usr/local/bin/router_app
+
+    pop1:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ./frr/pop1/bgpd.conf:/etc/frr/bgpd.conf
+      # TODO: also provide zebra/daemons configs later if needed
+
+    pop2:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - ./frr/pop2/bgpd.conf:/etc/frr/bgpd.conf
+
+  links:
+    # Client to each PoP (simulates “reaching the nearest”)
+    - endpoints: ["client:eth1", "pop1:eth1"]
+    - endpoints: ["client:eth2", "pop2:eth1"]
+
+    # PoPs to alpha (internal backbone side)
+    - endpoints: ["pop1:eth2", "alpha:eth1"]
+    - endpoints: ["pop2:eth2", "alpha:eth2"]
+
+# ---------------------------------------------------------------------
+# TODO (later):
+#  - Assign per-interface IPs with containerlab's "ipv4" attributes
+#  - Add mgmt addresses or use defaults
+#  - Provide zebra.conf/daemons in ./frr/pop{1,2}/ if needed
+#  - Add a second alpha link to simulate multiple internal paths
+# ---------------------------------------------------------------------

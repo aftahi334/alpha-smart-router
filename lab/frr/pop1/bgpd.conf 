@@ -1,0 +1,28 @@
+!
+! Alpha Anycast Demo — POP1 (Placeholder)
+! File: lab/frr/pop1/bgpd.conf
+!
+! STATUS: Placeholder only — fill in neighbors/ASNs/anycast prefix.
+!
+
+hostname pop1
+password zebra
+log stdout
+
+router bgp 65001
+ bgp router-id 1.1.1.1
+
+ ! TODO: define iBGP/eBGP neighbors with actual interface IPs
+ ! neighbor 192.0.2.2 remote-as 65000
+ ! neighbor 192.0.2.3 remote-as 65000
+
+ ! TODO: advertise the Anycast prefix (same as POP2)
+ ! network 10.99.0.1/32
+
+ ! Optional tuning (later)
+ ! timers bgp 3 9
+ ! no bgp default ipv4-unicast
+
+!
+line vty
+!

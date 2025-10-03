@@ -1,0 +1,13 @@
+[requires]
+tomlplusplus/3.4.0
+spdlog/1.14.1
+gtest/1.14.0
+benchmark/1.8.3
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout
+

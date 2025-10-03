@@ -1,0 +1,10 @@
+{
+  "name": "alpha-smart-router-docs",
+  "private": true,
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^10.9.1"
+  },
+  "scripts": {
+    "diagrams": "bash -c 'for f in docs/diagrams/*.mmd; do ./node_modules/.bin/mmdc -i \"$f\" -o \"${f%.mmd}.svg\" -C docs/diagrams/mmdc.json; done'"
+  }
+}

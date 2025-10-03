@@ -1,0 +1,76 @@
+%% file: docs/diagrams/architecture.mmd
+%% Mermaid v10+ compatible, safe for mmdc
+
+flowchart LR
+
+%% ================== CLUSTERS ==================
+    subgraph Ingress["Ingress / Egress Interfaces"]
+        NIC["Ethernet / TUN/TAP (RX)"]
+        EGRESS["TX Driver / Socket (TX)"]
+    end
+
+    subgraph Mem["alpha::mem — Preallocated Primitives"]
+        direction TB
+        POOL["PacketPool<br/>(fixed-capacity, preallocated)"]
+        SPSC["SPSC Queue<br/>(bounded SPSC)"]
+    end
+
+    subgraph Routing["alpha::routing — Core Logic"]
+        direction TB
+        SEL["Ingress Selector"]
+        PS["Path Selection"]
+        QoS["QoS Policy"]
+        FAIL["Failover / Multipath"]
+        RIB["RIB (routing table)"]
+    end
+
+    subgraph Ctl["Control / Management Plane"]
+        SRV["Service Registry<br/>(config, feature flags)"]
+        OBS["Observability<br/>(metrics, logs, tracing)"]
+    end
+
+    subgraph Apps["Apps / Tools"]
+        ROUTER["router_app (main)"]
+        PING["ping_tool (demo)"]
+        API["Mgmt API (planned)"]
+    end
+
+    subgraph Lab["Lab / Simulation"]
+        BGPSIM["BGP Speaker (sim) (planned)"]
+    end
+
+%% ================== DATA PLANE ==================
+    ROUTER --> NIC
+    ROUTER --> EGRESS
+
+    NIC -->|"RX packets"| SEL
+    SEL --> SPSC
+    SPSC -->|"pop()"| PS
+    PS --> QoS --> FAIL -->|"selected path"| EGRESS
+
+%% ================== RIB / CONTROL INTERACTIONS ==================
+    PS --> RIB
+    BGPSIM -. "BGP UPDATEs" .-> RIB
+    SRV -. "cfg (peers/prefixes)" .-> BGPSIM
+
+%% ================== MEMORY INTERACTIONS (RT: no heap after start) ==================
+    PS -. "alloc/free" .-> POOL
+    QoS -. "read" .-> POOL
+    FAIL -. "read" .-> POOL
+
+%% ================== CONTROL / OBSERVABILITY ==================
+    SRV -. "cfg updates" .-> SEL
+    SRV -. "cfg updates" .-> PS
+    SRV -. "cfg updates" .-> QoS
+    SRV -. "cfg updates" .-> FAIL
+
+    SEL -. "metrics/logs" .-> OBS
+    PS  -. "metrics/logs" .-> OBS
+    QoS -. "metrics/logs" .-> OBS
+    FAIL -. "metrics/logs" .-> OBS
+    RIB -. "metrics/logs" .-> OBS
+    BGPSIM -. "session state" .-> OBS
+
+%% ================== CLASSES ==================
+    classDef planned stroke-dasharray: 5 5,fill:#f6f6f6,stroke:#bbb,stroke-width:1px;
+    class API,BGPSIM planned
