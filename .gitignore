@@ -1,0 +1,92 @@
+###############################################################################
+# Alpha Smart Router - Professional .gitignore
+# Covers: C++20, CMake, Conan, CLion, Ninja, macOS, Node tooling (optional)
+###############################################################################
+
+########################
+# Build Artifacts
+########################
+/build/
+/cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# Ninja build system files
+.ninja_deps
+.ninja_log
+
+########################
+# CMake Presets
+########################
+# Shared presets should be versioned (CMakePresets.json).
+# Local user presets must be ignored.
+CMakeUserPresets.json
+
+########################
+# Conan Package Manager
+########################
+/conan.lock
+/conanbuildinfo.*
+/generators/
+/.conan/
+conan_paths.cmake
+conan_toolchain.cmake
+
+########################
+# IDE & Editor Files
+########################
+# JetBrains CLion
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VSCode (if ever used)
+/.vscode/
+
+########################
+# OS / System Files
+########################
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+########################
+# Logs & Coverage
+########################
+*.log
+*.gcda
+*.gcno
+*.lcov
+
+########################
+# Test / Benchmark Outputs
+########################
+/test-results/
+/benchmark-results/
+/Testing/
+
+########################
+# Node.js (optional tooling, e.g. diagrams/docs)
+########################
+# Node.js dependencies (never commit, huge size)
+/node_modules/
+#/package-lock.json   # optional: keep if npm tooling used
+
+########################
+# Editor backup files
+########################
+*.save
+
