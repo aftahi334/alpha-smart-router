@@ -9,6 +9,7 @@ namespace alpha::routing {
         b.seq.store(odd, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_release);
         b.fn.store(nullptr, std::memory_order_relaxed);
+        b.decision_fn.store(nullptr, std::memory_order_relaxed);
         b.state.store(nullptr, std::memory_order_relaxed);
         // Publish even seq with release; readers that see even also see fn/state.
         b.seq.store(odd + 1u, std::memory_order_release);
@@ -29,11 +30,42 @@ namespace alpha::routing {
         out_fn=nullptr; out_state=nullptr; return false;
     }
 
+    bool dp::snapshot_decision_binding(const PolicyBinding& b,
+                                       ChooseDecisionFn& out_fn,
+                                       void*& out_state) noexcept {
+        for (int i = 0; i < 4; ++i) {
+            const auto s1 = b.seq.load(std::memory_order_acquire);
+            if ((s1 & 1u) != 0u) continue;
+            const auto fn = b.decision_fn.load(std::memory_order_relaxed);
+            const auto st = b.state.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const auto s2 = b.seq.load(std::memory_order_relaxed);
+            if (s1 == s2) { out_fn = fn; out_state = st; return fn && st; }
+        }
+        out_fn = nullptr;
+        out_state = nullptr;
+        return false;
+    }
+
     PathId dp::select_path(const PolicyBinding& b,
                            std::span<const CandidateRef> cands,
                            const PacketContext& pkt) noexcept {
         ChooseFn fn{}; void* st{};
-        if (!snapshot_binding(b, fn, st)) return 0;
+        if (!snapshot_binding(b, fn, st)) return kInvalidPathId;
+        return fn(st, cands, pkt);
+    }
+
+    RouteDecision dp::select_path_decision(const PolicyBinding& b,
+                                           std::span<const CandidateRef> cands,
+                                           const PacketContext& pkt) noexcept {
+        if (cands.empty()) {
+            return RouteDecision{kInvalidPathId, SelectReason::NoCandidates};
+        }
+        ChooseDecisionFn fn{};
+        void* st{};
+        if (!snapshot_decision_binding(b, fn, st)) {
+            return RouteDecision{kInvalidPathId, SelectReason::SnapshotUnavailable};
+        }
         return fn(st, cands, pkt);
     }
 

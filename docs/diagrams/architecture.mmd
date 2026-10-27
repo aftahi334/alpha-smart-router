@@ -5,72 +5,55 @@ flowchart LR
 
 %% ================== CLUSTERS ==================
     subgraph Ingress["Ingress / Egress Interfaces"]
-        NIC["Ethernet / TUN/TAP (RX)"]
-        EGRESS["TX Driver / Socket (TX)"]
+        NIC["RX Producer / Traffic Gen"]
+        EGRESS["Simulated TX / Egress"]
     end
 
     subgraph Mem["alpha::mem — Preallocated Primitives"]
         direction TB
         POOL["PacketPool<br/>(fixed-capacity, preallocated)"]
-        SPSC["SPSC Queue<br/>(bounded SPSC)"]
+        SPSC["SpscQueue&lt;PacketHandle&gt;<br/>(lock-free ring, construct_at/destroy_at)"]
     end
 
-    subgraph Routing["alpha::routing — Core Logic"]
+    subgraph DP["alpha::routing — Data Plane Fast Path"]
         direction TB
-        SEL["Ingress Selector"]
-        PS["Path Selection"]
-        QoS["QoS Policy"]
-        FAIL["Failover / Multipath"]
-        RIB["RIB (routing table)"]
+        SEL["IngressSelector<br/>(RR / HashSourceIP / Hash5Tuple / BGP)"]
+        PB["PolicyBinding + MetricsSlot<br/>(lock-free seqlock snapshots)"]
+        PS["Path Selection<br/>(RoundRobin / FlowHash / LatencyAware)"]
     end
 
-    subgraph Ctl["Control / Management Plane"]
-        SRV["Service Registry<br/>(config, feature flags)"]
-        OBS["Observability<br/>(metrics, logs, tracing)"]
+    subgraph CP["alpha::routing — Control Plane (Single Writer)"]
+        direction TB
+        SRV["ServiceRegistry<br/>(RCU atomic shared_ptr Map)"]
+        QoS["QoSPolicy<br/>(QoSPathMetrics → to_dp_metrics)"]
+        FAIL["FailoverPolicy<br/>(min_hold_ms &amp; recovery_hold_ms)"]
+        BGPSIM["SimulatedBgpOracle<br/>(LP / AS-Path / MED / IGP)"]
     end
 
-    subgraph Apps["Apps / Tools"]
-        ROUTER["router_app (main)"]
-        PING["ping_tool (demo)"]
-        API["Mgmt API (planned)"]
+    subgraph Obs["alpha::obs &amp; alpha::rt"]
+        OBS["Observability<br/>(counters, decisions, drops)"]
+        RT["OS Runtime<br/>(mlockall, CPU affinity, SCHED_FIFO)"]
     end
 
-    subgraph Lab["Lab / Simulation"]
-        BGPSIM["BGP Speaker (sim) (planned)"]
-    end
+%% ================== DATA PLANE HOT PATH ==================
+    NIC -->|"1. acquire() PacketHandle"| POOL
+    NIC -->|"2. chooseIngress()"| SEL
+    SEL -->|"3. push(PacketHandle)"| SPSC
+    SPSC -->|"4. pop(PacketHandle)"| PS
+    PB -->|"seqlock read"| PS
+    PS -->|"5. RouteDecision (SelectedHealthy / DegradedFallback)"| EGRESS
+    EGRESS -->|"6. release(PacketHandle)"| POOL
 
-%% ================== DATA PLANE ==================
-    ROUTER --> NIC
-    ROUTER --> EGRESS
+%% ================== CONTROL PLANE PUBLICATIONS ==================
+    SRV -. "RCU snapshot (PopList)" .-> SEL
+    BGPSIM -. "serving_pop()" .-> SEL
+    QoS -. "cp::update_metrics()" .-> PB
+    FAIL -. "cp::publish_policy()" .-> PB
 
-    NIC -->|"RX packets"| SEL
-    SEL --> SPSC
-    SPSC -->|"pop()"| PS
-    PS --> QoS --> FAIL -->|"selected path"| EGRESS
+%% ================== OBSERVABILITY & RUNTIME ==================
+    SEL -. "counters" .-> OBS
+    PS  -. "SelectReason" .-> OBS
+    FAIL -. "FailoverDecision" .-> OBS
+    RT -. "pin &amp; lock" .-> NIC
+    RT -. "pin &amp; lock" .-> PS
 
-%% ================== RIB / CONTROL INTERACTIONS ==================
-    PS --> RIB
-    BGPSIM -. "BGP UPDATEs" .-> RIB
-    SRV -. "cfg (peers/prefixes)" .-> BGPSIM
-
-%% ================== MEMORY INTERACTIONS (RT: no heap after start) ==================
-    PS -. "alloc/free" .-> POOL
-    QoS -. "read" .-> POOL
-    FAIL -. "read" .-> POOL
-
-%% ================== CONTROL / OBSERVABILITY ==================
-    SRV -. "cfg updates" .-> SEL
-    SRV -. "cfg updates" .-> PS
-    SRV -. "cfg updates" .-> QoS
-    SRV -. "cfg updates" .-> FAIL
-
-    SEL -. "metrics/logs" .-> OBS
-    PS  -. "metrics/logs" .-> OBS
-    QoS -. "metrics/logs" .-> OBS
-    FAIL -. "metrics/logs" .-> OBS
-    RIB -. "metrics/logs" .-> OBS
-    BGPSIM -. "session state" .-> OBS
-
-%% ================== CLASSES ==================
-    classDef planned stroke-dasharray: 5 5,fill:#f6f6f6,stroke:#bbb,stroke-width:1px;
-    class API,BGPSIM planned

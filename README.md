@@ -9,7 +9,7 @@
 
 ## 📌 Project Timeline
 Project incubated locally from September 2024 with ongoing design and coding.
-First public baseline release (v0.1.0) in October 2025. Development ongoing — see CHANGELOG.md for release history.
+First public baseline release (`v0.1.0`) in October 2025; `v0.2.0` routing semantics & lock-free hardening completed in October 2026. Development ongoing — see `CHANGELOG.md` for release history.
 
 👉 See [CHANGELOG.md](CHANGELOG.md) for full project evolution.
 
@@ -22,21 +22,21 @@ Alpha Smart Router is a simulation of a smart network router, designed with **re
 
 ```mermaid
 flowchart LR
-  A[v0.1.0 – Baseline] --> B[v0.2.0 – Integration]
-B --> C[MVP – Full Pipeline]
+  A[v0.1.0 – Baseline] --> B[v0.2.0 – Routing & Hardening]
+  B --> C[v0.3.0 – Full Pipeline MVP]
 
-A:::done
-B:::inprog
-C:::future
+  A:::done
+  B:::done
+  C:::inprog
 
-classDef done fill:#4CAF50,stroke:#333,stroke-width:2px,color:#fff;
-classDef inprog fill:#FFC107,stroke:#333,stroke-width:2px,color:#000;
-classDef future fill:#2196F3,stroke:#333,stroke-width:2px,color:#fff;
+  classDef done fill:#4CAF50,stroke:#333,stroke-width:2px,color:#fff;
+  classDef inprog fill:#FFC107,stroke:#333,stroke-width:2px,color:#000;
+  classDef future fill:#2196F3,stroke:#333,stroke-width:2px,color:#fff;
 ```
 
-- **Milestone 1–2 (Completed):** Lock-free `SpscQueue<T>` / `PacketPool` lifetime & bounds hardening, race-free `MetricsSlot` / `PolicyBinding` seqlocks, and unified CP (`QoSPathMetrics`) ↔ DP (`PathMetrics`) routing data model.
-- **Milestone 3 (Next):** Complete routing semantics (`ServiceRegistry` upsert/bounds, `IngressSelector` flow hashing, `FailoverPolicy` recovery hold timers) and unit tests (`test_ingress`, `test_failover`).
-- **Milestone 4–6 (Planned):** Config loading, observability counters/probes, and end-to-end `router_app` + `ping_tool` Linux pipeline.
+- **v0.1.0 – Baseline Architecture (Completed):** Initial lock-free `SpscQueue<T>` / `PacketPool` foundation, `ServiceRegistry` RCU snapshots, and `spsc_bench`.
+- **v0.2.0 – Routing Semantics & Concurrency Hardening (Completed):** Hardened `SpscQueue<T>` / `PacketPool` lifetimes & bounds, atomic `MetricsSlot` / `PolicyBinding` seqlocks, CP (`QoSPathMetrics`) ↔ DP (`PathMetrics`) separation, `ServiceRegistry` upsert/capacity bounds, `IngressSelector` IP/5-tuple hashing & `SimulatedBgpOracle` fallback, `FailoverPolicy` dwell/recovery-hold hysteresis, DSCP ↔ `QoSClass` matching, and explicit `RouteDecision`/`SelectReason` outcomes.
+- **v0.3.0 – Full Pipeline MVP (In Progress):** TOML config loading, observability counters/probes, and end-to-end `router_app` + `ping_tool` Linux pipeline.
 
 ## 🚦 Reliability Philosophy
 Routers never aim for **zero packet loss** — they aim for **loss under control**.
@@ -109,14 +109,19 @@ Routers never aim for **zero packet loss** — they aim for **loss under control
 ### Data Plane Packet Flow
 [![Packet Flow](docs/diagrams/packet_flow.svg)](docs/diagrams/packet_flow.svg)
 
+### Control Plane ↔ Data Plane Lock-Free Synchronization
+[![CP-DP Concurrency](docs/diagrams/cp_dp_concurrency.svg)](docs/diagrams/cp_dp_concurrency.svg)
+
+### Routing Decision & Failover Hysteresis Flow
+[![Routing Decision Flow](docs/diagrams/routing_decision_flow.svg)](docs/diagrams/routing_decision_flow.svg)
+
 ### Memory Management (Real-Time Safe)
 [![MemoryOverview](docs/diagrams/mem_overview.svg)](docs/diagrams/mem_overview.svg)
 
 
 ## ✅ Validation & Benchmarking
-- Unit tests (GoogleTest) are included under `tests/` — covering memory primitives, routing policies, and QoS.
-- Placeholders for failover and ingress tests are in place, scheduled for v0.2.0.
-- Benchmarks (`bench/spsc_bench.cpp`) - Measures round-trip throughput for `push+pop` pairs using two payload types:
+- Unit tests (GoogleTest) are included under `tests/` — covering memory primitives (`test_mem.cpp`), service registry & seqlock policies (`test_routing.cpp`), QoS scoring & DSCP matching (`test_qos.cpp`), ingress selection (`test_ingress.cpp`), and failover hysteresis (`test_failover.cpp`).
+- Benchmarks (`benchmarks/spsc_bench.cpp`) - Measures round-trip throughput for `push+pop` pairs using two payload types:
 *   1) `int` (trivially copyable)
 *   2) `std::unique_ptr<int>` (move-only)
 
@@ -151,15 +156,20 @@ alpha-smart-router/
 │   ├── router_app/        # Main router pipeline app
 │   └── ping_tool/         # RTT testing tool
 ├── tests/                 # Unit tests (GoogleTest)
-│   ├── test_mem/          # Tests for SpscQueue<T> (owning, RT) and PacketPool
-│   └── test_routing/      # Tests for ServiceRegistry RCU semantics + heterogeneous lookup
+│   ├── test_mem.cpp       # SpscQueue<T> lifetime/bounds and PacketPool tests
+│   ├── test_routing.cpp   # ServiceRegistry RCU, MetricsSlot, PolicyBinding, PathSelection
+│   ├── test_qos.cpp       # QoSPolicy scoring, DSCP classification, CP<->DP conversions
+│   ├── test_ingress.cpp   # IngressSelector RR, HashSourceIP, Hash5Tuple, RouteInformed
+│   └── test_failover.cpp  # FailoverPolicy dwell, primary recovery hold, degraded policy
 ├── benchmarks/                  # Benchmarks (Google Benchmark)
 │   └── spsc_bench.cpp           # Measures round-trip throughput for push+pop (copyable & move-only)
 ├── docs/
 │   ├── diagrams/                        # Final design diagrams (SVGs)
 │   │   ├── architecture.svg             # Layered system blueprint
 │   │   ├── packet_flow.svg              # Data plane packet flow
-│   │   ├── memory_overview.svg          # Data plane memory management
+│   │   ├── cp_dp_concurrency.svg        # Lock-free CP ↔ DP synchronization
+│   │   ├── routing_decision_flow.svg    # DP path selection & CP failover hysteresis
+│   │   ├── mem_overview.svg             # Data plane memory management
 │   │
 │   └── verification/                    # Validation and test coverage
 │       └── verification_plan.md         # Maps requirements → tests → results

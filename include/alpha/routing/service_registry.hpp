@@ -9,11 +9,14 @@
 
 
 #include <atomic>
+#include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -150,7 +153,7 @@ private:
     // Validation helpers
     static bool validateId(std::string_view id, std::size_t maxLen) noexcept;
     static bool validateIp(std::string_view ip) noexcept;
-    static bool validatePops(const PopList& pops) noexcept;
+    static bool validatePops(std::span<const Pop> pops) noexcept;
 
     // Internal mode for mutation routing.
     enum class Mode { Add, Replace, Upsert };
@@ -158,7 +161,76 @@ private:
     template <class PopLike>
     RegistryErr addOrReplaceAdapter(Mode mode, std::string_view service_id, std::span<const PopLike> pops_like);
 
-    RegistryErr mutate(Mode mode, std::string_view service_id, const PopList& pops);
+    RegistryErr mutate(Mode mode, std::string_view service_id, std::span<const Pop> pops);
 };
+
+// --------------------------- Template Implementations ------------------------
+
+template <class PopLike>
+std::vector<PopLike> ServiceRegistry::getPopsAs(std::string_view service_id) const {
+    std::vector<PopLike> out;
+    auto snap = snapshot();
+    if (!snap) return out;
+    auto it = snap->find(service_id);
+    if (it == snap->end()) return out;
+
+    out.reserve(it->second.size());
+    for (const auto& p : it->second) {
+        if constexpr (std::same_as<std::remove_cv_t<PopLike>, Pop>) {
+            out.push_back(p);
+        } else {
+            PopLike item{};
+            item.id     = p.id;
+            item.region = p.region;
+            item.ip     = p.ip;
+            out.push_back(std::move(item));
+        }
+    }
+    return out;
+}
+
+template <class PopLike>
+RegistryErr ServiceRegistry::addOrReplaceAdapter(Mode mode,
+                                                 std::string_view service_id,
+                                                 std::span<const PopLike> pops_like) {
+    if constexpr (std::same_as<std::remove_cv_t<PopLike>, Pop>) {
+        return mutate(mode, service_id, pops_like);
+    } else {
+        if (pops_like.empty() || pops_like.size() > Limits::MaxPopsPerService) {
+            failures_.fetch_add(1, std::memory_order_relaxed);
+            return RegistryErr::Invalid;
+        }
+        PopList converted;
+        converted.reserve(pops_like.size());
+        for (const auto& pl : pops_like) {
+            Pop p{};
+            p.id     = pl.id;
+            p.region = pl.region;
+            p.ip     = pl.ip;
+            converted.push_back(std::move(p));
+        }
+        return mutate(mode, service_id, std::span<const Pop>(converted.data(), converted.size()));
+    }
+}
+
+template <class PopLike>
+RegistryErr ServiceRegistry::addService(std::string_view service_id, std::span<const PopLike> pops_like) {
+    return addOrReplaceAdapter(Mode::Add, service_id, pops_like);
+}
+
+template <class PopLike>
+RegistryErr ServiceRegistry::replaceService(std::string_view service_id, std::span<const PopLike> pops_like) {
+    return addOrReplaceAdapter(Mode::Replace, service_id, pops_like);
+}
+
+template <class PopLike>
+RegistryErr ServiceRegistry::upsertService(std::string_view service_id, std::span<const PopLike> pops_like) {
+    return addOrReplaceAdapter(Mode::Upsert, service_id, pops_like);
+}
+
+template <class PopLike>
+bool ServiceRegistry::addServiceBool(std::string_view service_id, std::span<const PopLike> pops_like) {
+    return addService(service_id, pops_like) == RegistryErr::Ok;
+}
 
 } // namespace alpha::routing

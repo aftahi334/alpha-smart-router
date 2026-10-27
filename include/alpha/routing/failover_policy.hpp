@@ -29,6 +29,7 @@ struct FailoverConfig {
     double      improve_pct_to_switch{alpha::config::constants::FAILOVER_IMPROVE_PCT_TO_SWITCH}; ///< Required relative improvement
     uint32_t    min_hold_ms{alpha::config::constants::FAILOVER_MIN_HOLD_MS};   ///< Dwell time before switching
     uint32_t    recovery_hold_ms{alpha::config::constants::FAILOVER_RECOVERY_HOLD_MS}; ///< Primary recovery dwell
+    bool        allow_degraded{true};        ///< Permit HealthState::Degraded candidates as fallback
 };
 
 /** @struct PathHealth
@@ -58,6 +59,8 @@ public:
 
     /**
      * @brief Evaluate the need to switch from the current path.
+     * @details Uses internally tracked selection-change timestamp for `min_hold_ms`
+     *          and `PathHealth::last_change` for primary `recovery_hold_ms`.
      * @param current_path_id Current active path identifier.
      * @param scored_candidates Vector of QoS scores for candidate paths.
      * @param health Vector of health states corresponding to paths.
@@ -70,6 +73,34 @@ public:
              const std::vector<PathHealth>& health,
              std::chrono::steady_clock::time_point now) const;
 
+    /**
+     * @brief Evaluate failover with an explicit last-selected-path switch timestamp.
+     * @param current_path_id Current active path identifier.
+     * @param scored_candidates Vector of QoS scores for candidate paths.
+     * @param health Vector of health states corresponding to paths.
+     * @param now Monotonic time for hysteresis checks.
+     * @param last_switch_time Timestamp when `current_path_id` was selected.
+     * @return A decision if a switch is recommended; std::nullopt to keep current.
+     */
+    std::optional<FailoverDecision>
+    evaluate(const std::string& current_path_id,
+             const std::vector<QoSScore>& scored_candidates,
+             const std::vector<PathHealth>& health,
+             std::chrono::steady_clock::time_point now,
+             std::chrono::steady_clock::time_point last_switch_time) const;
+
+    /// Record an explicit path selection change at `when`.
+    void note_switch(std::string path_id,
+                     std::chrono::steady_clock::time_point when) noexcept {
+        tracked_path_id_  = std::move(path_id);
+        last_switch_time_ = when;
+    }
+
+    /// @return Timestamp of the last recorded path switch.
+    [[nodiscard]] std::chrono::steady_clock::time_point last_switch_time() const noexcept {
+        return last_switch_time_;
+    }
+
     /// @return Current configuration (by const reference).
     const FailoverConfig& config() const noexcept { return cfg_; }
 
@@ -80,13 +111,19 @@ private:
     /// Lookup a path's HealthState.
     static HealthState state_of(const std::string& id, const std::vector<PathHealth>& h);
 
+    /// Lookup a path's last health transition timestamp.
+    static std::chrono::steady_clock::time_point
+    last_health_change_of(const std::string& id, const std::vector<PathHealth>& h) noexcept;
+
     /// Check dwell/hold timers to allow switching.
-    bool allow_switch(std::chrono::steady_clock::time_point current_last_change,
+    bool allow_switch(std::chrono::steady_clock::time_point since,
                       std::chrono::steady_clock::time_point now,
                       uint32_t hold_ms) const noexcept;
 
 private:
     FailoverConfig cfg_{}; ///< Policy configuration
+    mutable std::string tracked_path_id_{}; ///< Last observed/selected active path
+    mutable std::chrono::steady_clock::time_point last_switch_time_{}; ///< Last path switch time
 };
 
 } // namespace alpha::routing

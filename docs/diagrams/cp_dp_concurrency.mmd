@@ -1,0 +1,35 @@
+%% file: docs/diagrams/cp_dp_concurrency.mmd
+%% Mermaid v10+ compatible, safe for mmdc
+
+flowchart TB
+
+    subgraph CP["Control Plane (Single Writer — Setup / Telemetry Thread)"]
+        direction LR
+        CP_REG["ServiceRegistry::mutate()<br/>• Copy-on-Write Map<br/>• Limits::MaxServices = 128<br/>• Stack-only IP/ID validation"]
+        CP_QOS["QoSPolicy + FailoverPolicy<br/>• QoSPathMetrics (loss ratio 0.0..1.0)<br/>• score_path() &amp; evaluate()<br/>• to_dp_metrics() + to_dp_qos_class()"]
+        CP_POL["Policy Publisher<br/>• cp::publish_policy(binding, policy)<br/>• cp::clear_policy(binding)"]
+    end
+
+    subgraph SYNC["Lock-Free Synchronization &amp; Memory-Model Boundary"]
+        direction LR
+        RCU["RCU Snapshot Swap<br/>std::shared_ptr&lt;const Map&gt;<br/>Writer: atomic_store(release)<br/>Reader: atomic_load(acquire)"]
+        MSLOT["MetricsSlot Seqlock (alignas 64)<br/>Writer: seq=odd → release fence →<br/>atomic fields → seq=even (release)<br/>Reader: seq1(acquire) → atomic loads →<br/>acquire fence → seq1 == seq2"]
+        PBIND["PolicyBinding Seqlock (alignas 64)<br/>Writer: seq=odd → release fence →<br/>fn/decision_fn/state → seq=even (release)<br/>Reader: snapshot_decision_binding()"]
+    end
+
+    subgraph DP["Data Plane (Lock-Free Multi-Reader Hot Path — No Heap / No Locks)"]
+        direction LR
+        DP_ING["IngressSelector<br/>• Reads PopList (Health != Down)<br/>• mix() / hash_ipv4() / hash_five_tuple()"]
+        DP_SEL["PathSelection Policies<br/>• RoundRobin / FlowHash / LatencyAware<br/>• PathMetrics (loss_ppm, rtt_us, jitter_us)<br/>• qos_match(path_class, pkt.dscp)"]
+        DP_DEC["RouteDecision<br/>• path_id + SelectReason<br/>• Bounded 4-attempt seqlock retry"]
+    end
+
+    CP_REG -->|"publish new Map"| RCU
+    RCU -->|"snapshot() / getPopsCopy()"| DP_ING
+
+    CP_QOS -->|"cp::update_metrics()"| MSLOT
+    MSLOT -->|"dp::load_metrics()"| DP_SEL
+
+    CP_POL -->|"publish / clear"| PBIND
+    PBIND -->|"dp::select_path_decision()"| DP_DEC
+    DP_SEL --> DP_DEC

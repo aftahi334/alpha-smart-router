@@ -9,11 +9,12 @@
 #include "alpha/routing/service_registry.hpp"
 
 #include <algorithm>
-#include <memory>   // atomic_load/atomic_store for shared_ptr
+#include <array>
+#include <arpa/inet.h>
 #include <cassert>
 #include <cstring>
+#include <memory>   // atomic_load/atomic_store for shared_ptr
 #include <string_view>
-#include <arpa/inet.h>
 
 namespace alpha::routing {
 
@@ -35,25 +36,34 @@ bool ServiceRegistry::validateId(std::string_view id, std::size_t maxLen) noexce
 
 bool ServiceRegistry::validateIp(std::string_view ip) noexcept {
     if (ip.empty() || ip.size() > Limits::MaxIpLen) return false;
-    // Try IPv4 then IPv6
+    if (ip.find('\0') != std::string_view::npos) return false;
+
+    char ip_cstr[Limits::MaxIpLen + 1]{};
+    std::memcpy(ip_cstr, ip.data(), ip.size());
+    ip_cstr[ip.size()] = '\0';
+
+    // Try IPv4 then IPv6 without heap allocation
     unsigned char buf[sizeof(struct in6_addr)];
-    if (inet_pton(AF_INET,  std::string(ip).c_str(), buf) == 1) return true;
-    if (inet_pton(AF_INET6, std::string(ip).c_str(), buf) == 1) return true;
+    if (inet_pton(AF_INET,  ip_cstr, buf) == 1) return true;
+    if (inet_pton(AF_INET6, ip_cstr, buf) == 1) return true;
     return false;
 }
 
-bool ServiceRegistry::validatePops(const PopList& pops) noexcept {
+bool ServiceRegistry::validatePops(std::span<const Pop> pops) noexcept {
     if (pops.empty() || pops.size() > Limits::MaxPopsPerService) return false;
     // unique ids, fields non-empty & within limits, valid IP
-    std::vector<std::string_view> ids; ids.reserve(pops.size());
+    std::array<std::string_view, Limits::MaxPopsPerService> ids{};
+    std::size_t count = 0;
     for (const auto& p : pops) {
         if (!validateId(p.id, Limits::MaxIdLen)) return false;
         if (!validateId(p.region, Limits::MaxRegionLen)) return false;
         if (!validateIp(p.ip)) return false;
-        ids.push_back(p.id);
+        ids[count++] = p.id;
     }
-    std::sort(ids.begin(), ids.end());
-    if (std::adjacent_find(ids.begin(), ids.end()) != ids.end()) return false;
+    auto begin = ids.begin();
+    auto end   = ids.begin() + static_cast<std::ptrdiff_t>(count);
+    std::sort(begin, end);
+    if (std::adjacent_find(begin, end) != end) return false;
     return true;
 }
 
@@ -93,29 +103,25 @@ std::vector<std::string> ServiceRegistry::listServices() const {
 }
 
 RegistryErr ServiceRegistry::addService(std::string_view service_id, std::span<const Pop> pops) {
-    PopList list(pops.begin(), pops.end());
-    return mutate(Mode::Add, service_id, list);
+    return mutate(Mode::Add, service_id, pops);
 }
 
 RegistryErr ServiceRegistry::replaceService(std::string_view service_id, std::span<const Pop> pops) {
-    PopList list(pops.begin(), pops.end());
-    return mutate(Mode::Replace, service_id, list);
+    return mutate(Mode::Replace, service_id, pops);
 }
 
 RegistryErr ServiceRegistry::upsertService(std::string_view service_id, std::span<const Pop> pops) {
-    PopList list(pops.begin(), pops.end());
-    return mutate(Mode::Upsert, service_id, list);
+    return mutate(Mode::Upsert, service_id, pops);
 }
 
 bool ServiceRegistry::removeService(std::string_view service_id) noexcept {
     auto snap = snapshot();
     if (!snap || snap->empty()) return false;
+    if (snap->find(service_id) == snap->end()) return false;
 
     auto next = std::make_shared<Map>(*snap);
-    auto it = next->find(service_id);
-    bool erased = (it != next->end());
-    if (erased) next->erase(it);
-    if (!erased) return false;
+    const auto erased = next->erase(std::string(service_id));
+    if (erased == 0) return false;
 
     // RCU update: publish new snapshot. RELEASE pairs with reader ACQUIRE so that
     // all prior writes to *next (the new map) are visible to readers that load it.
@@ -136,9 +142,19 @@ void ServiceRegistry::clear() noexcept {
     // Not counting as failure/success here; treated as maintenance op.
 }
 
+ServiceRegistry::Stats ServiceRegistry::stats() const noexcept {
+    return Stats{
+        .adds     = adds_.load(std::memory_order_relaxed),
+        .replaces = replaces_.load(std::memory_order_relaxed),
+        .upserts  = upserts_.load(std::memory_order_relaxed),
+        .removes  = removes_.load(std::memory_order_relaxed),
+        .failures = failures_.load(std::memory_order_relaxed),
+    };
+}
+
 //------------------------------- Mutation Core --------------------------------
 
-RegistryErr ServiceRegistry::mutate(Mode mode, std::string_view service_id, const PopList& pops) {
+RegistryErr ServiceRegistry::mutate(Mode mode, std::string_view service_id, std::span<const Pop> pops) {
     // Basic input checks
     if (!validateId(service_id, Limits::MaxIdLen)) { failures_.fetch_add(1, std::memory_order_relaxed); return RegistryErr::Invalid; }
     if (!validatePops(pops))                        { failures_.fetch_add(1, std::memory_order_relaxed); return RegistryErr::Invalid; }
@@ -146,20 +162,27 @@ RegistryErr ServiceRegistry::mutate(Mode mode, std::string_view service_id, cons
     auto snap = snapshot();
     if (!snap) { failures_.fetch_add(1, std::memory_order_relaxed); return RegistryErr::Invalid; }
 
-    if (snap->size() > Limits::MaxServices) {
+    const bool exists = (snap->find(service_id) != snap->end());
+
+    if (mode == Mode::Add && exists) {
+        failures_.fetch_add(1, std::memory_order_relaxed);
+        return RegistryErr::Exists;
+    }
+    if (mode == Mode::Replace && !exists) {
+        failures_.fetch_add(1, std::memory_order_relaxed);
+        return RegistryErr::NotFound;
+    }
+    if (!exists && snap->size() >= Limits::MaxServices) {
         failures_.fetch_add(1, std::memory_order_relaxed);
         return RegistryErr::Capacity;
     }
 
     auto next = std::make_shared<Map>(*snap); // copy-on-write
-    auto it   = next->find(service_id);
-    const bool exists = (it != next->end());
+    PopList next_pops(pops.begin(), pops.end());
 
     switch (mode) {
         case Mode::Add:
-            if (exists) { failures_.fetch_add(1, std::memory_order_relaxed); return RegistryErr::Exists; }
-            // insert (avoids default-construct + assign)
-            next->emplace(std::string(service_id), std::move(pops));
+            next->emplace(std::string(service_id), std::move(next_pops));
             { // publish
                 std::shared_ptr<const Map> cnext = std::move(next);
                 std::atomic_store_explicit(&map_, std::move(cnext), std::memory_order_release);
@@ -168,9 +191,10 @@ RegistryErr ServiceRegistry::mutate(Mode mode, std::string_view service_id, cons
             adds_.fetch_add(1, std::memory_order_relaxed);
             return RegistryErr::Ok;
 
-        case Mode::Replace:
-            if (!exists) { failures_.fetch_add(1, std::memory_order_relaxed); return RegistryErr::NotFound; }
-            it->second = std::move(pops);
+        case Mode::Replace: {
+            auto it = next->find(service_id);
+            assert(it != next->end());
+            it->second = std::move(next_pops);
             { // RCU update: publish new snapshot
                 std::shared_ptr<const Map> cnext = std::move(next);
                 std::atomic_store_explicit(&map_, std::move(cnext), std::memory_order_release);
@@ -178,9 +202,16 @@ RegistryErr ServiceRegistry::mutate(Mode mode, std::string_view service_id, cons
             version_.fetch_add(1, std::memory_order_relaxed);
             replaces_.fetch_add(1, std::memory_order_relaxed);
             return RegistryErr::Ok;
+        }
 
         case Mode::Upsert:
-            next->emplace(std::string(service_id), std::move(pops));
+            if (exists) {
+                auto it = next->find(service_id);
+                assert(it != next->end());
+                it->second = std::move(next_pops);
+            } else {
+                next->emplace(std::string(service_id), std::move(next_pops));
+            }
             { // RCU update: publish new snapshot
                 std::shared_ptr<const Map> cnext = std::move(next);
                 std::atomic_store_explicit(&map_, std::move(cnext), std::memory_order_release);

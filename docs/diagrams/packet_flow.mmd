@@ -1,24 +1,34 @@
 %% file: docs/diagrams/packet_flow.mmd
+%% Mermaid v10+ compatible, safe for mmdc
+
 flowchart LR
 
-%% Packet enters from NIC
-    NIC["NIC Driver (RX)"] --> INGRESS["Ingress Selector"]
+%% ================== PRODUCER (RX / INGRESS) ==================
+    subgraph RX["Producer Thread (Ingress / RX)"]
+        NIC["Traffic Gen / NIC RX"]
+        ING["IngressSelector<br/>• RoundRobin<br/>• HashSourceIP (IPv4/IPv6)<br/>• Hash5Tuple (Flow5Tuple)<br/>• RouteInformed (BgpOracle)"]
+    end
 
-%% Goes into queue
-    INGRESS -->|"enqueue()"| SPSC["SPSC Queue<br/>(bounded, preallocated)"]
+%% ================== MEMORY PRIMITIVES ==================
+    POOL["PacketPool<br/>(preallocated slab)"]
+    SPSC["SpscQueue&lt;PacketHandle&gt;<br/>(bounded power-of-2 ring)"]
 
-%% Routing logic consumes
-    SPSC -->|"dequeue()"| PS["Path Selection"]
-    PS --> QoS["QoS Policy"]
-    QoS --> FAIL["Failover / Multipath"]
+%% ================== CONSUMER (ROUTING / EGRESS) ==================
+    subgraph WORKER["Consumer Thread (Data-Plane Worker)"]
+        PB["dp::select_path_decision()<br/>• PolicyBinding seqlock<br/>• MetricsSlot seqlock<br/>• DSCP ↔ QoSClass match"]
+        OUT{"RouteDecision<br/>SelectReason?"}
+        TX["Simulated Egress (TX)<br/>SelectedHealthy / DegradedFallback"]
+        DROP["Drop &amp; Account<br/>NoCandidates / AllPathsUnhealthy /<br/>SnapshotUnavailable"]
+    end
 
-%% Consults routing table
-    PS --> RIB["RIB (routing table)"]
+%% ================== FLOW ==================
+    NIC -->|"1. acquire() → PacketHandle"| POOL
+    NIC -->|"2. chooseIngress(svc, flow)"| ING
+    ING -->|"3. push(PacketHandle)"| SPSC
+    SPSC -->|"4. pop(PacketHandle)"| PB
+    PB --> OUT
+    OUT -->|"forwarded() == true"| TX
+    OUT -->|"forwarded() == false"| DROP
+    TX -->|"5. release(PacketHandle)"| POOL
+    DROP -->|"5. release(PacketHandle)"| POOL
 
-%% Packet leaves
-    FAIL -->|"TX"| EGRESS["NIC Driver (TX)"]
-
-%% Memory flow
-    PS -. alloc/free .-> POOL["PacketPool<br/>(fixed-capacity)"]
-    QoS -. read .-> POOL
-    FAIL -. read .-> POOL

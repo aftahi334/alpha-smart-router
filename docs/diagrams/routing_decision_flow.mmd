@@ -1,0 +1,27 @@
+%% file: docs/diagrams/routing_decision_flow.mmd
+%% Mermaid v10+ compatible, safe for mmdc
+
+flowchart TD
+
+    subgraph CP_EVAL["Control Plane — FailoverPolicy::evaluate()"]
+        START["Evaluate Active Path vs Candidates"] --> CUR_DOWN{"Current path Down<br/>(or Degraded when<br/>!allow_degraded)?"}
+        CUR_DOWN -->|"Yes"| IMM["Immediate Switch<br/>reason: current_down / current_degraded<br/>(excludes unsoaked primary)"]
+        CUR_DOWN -->|"No"| R2P_CHK{"return_to_primary &amp;&amp;<br/>primary Up &amp;&amp;<br/>now - prim_health_change &gt;= recovery_hold_ms &amp;&amp;<br/>now - last_switch &gt;= min_hold_ms?"}
+        R2P_CHK -->|"Yes (prim.score &gt;= best)"| R2P["Switch to Primary<br/>reason: return_to_primary"]
+        R2P_CHK -->|"No"| MARGIN_CHK{"Best eligible candidate<br/>score &gt;= cur * (1 + improve_pct) &amp;&amp;<br/>now - last_switch &gt;= min_hold_ms?"}
+        MARGIN_CHK -->|"Yes"| MARGIN["Switch to Candidate<br/>reason: better_candidate_with_margin"]
+        MARGIN_CHK -->|"No"| KEEP["Keep Current Path<br/>(std::nullopt)"]
+    end
+
+    subgraph DP_EVAL["Data Plane — choose_decision(cands, pkt)"]
+        PKT["PacketContext { flow_hash, dscp }"] --> EMPTY{"cands.empty()?"}
+        EMPTY -->|"Yes"| NO_CAND["SelectReason::NoCandidates<br/>forwarded() = false"]
+        EMPTY -->|"No"| LOAD["Read MetricsSlot via dp::load_metrics()<br/>Filter m.healthy == true<br/>Tie-break RTT within tie_margin_us via qos_match()"]
+        LOAD --> HAS_HEALTHY{"Found healthy<br/>candidate?"}
+        HAS_HEALTHY -->|"Yes"| HEALTHY["SelectReason::SelectedHealthy<br/>forwarded() = true"]
+        HAS_HEALTHY -->|"No"| ANY_SNAP{"Any MetricsSlot<br/>snapshot loaded?"}
+        ANY_SNAP -->|"No (null / busy)"| SNAP_UNAVAIL["SelectReason::SnapshotUnavailable<br/>forwarded() = false"]
+        ANY_SNAP -->|"Yes (all unhealthy)"| DEG_OK{"allow_degraded_fallback?"}
+        DEG_OK -->|"True"| DEG_FWD["SelectReason::DegradedFallback<br/>forwarded() = true"]
+        DEG_OK -->|"False"| ALL_UNHEALTHY["SelectReason::AllPathsUnhealthy<br/>forwarded() = false"]
+    end

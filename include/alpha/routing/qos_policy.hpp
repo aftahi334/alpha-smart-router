@@ -62,6 +62,19 @@ struct QoSPathMetrics {
     double      loss{0.0};     ///< Packet loss ratio [0.0, 1.0]
 };
 
+/// Encode a QoSClass into a non-zero data-plane PathMetrics::qos_class value (1..4).
+/// 0 is reserved in PathMetrics::qos_class for "unclassified".
+[[nodiscard]] constexpr std::uint8_t to_dp_qos_class(QoSClass clazz) noexcept {
+    return static_cast<std::uint8_t>(static_cast<std::uint8_t>(clazz) + 1u);
+}
+
+/// Map a 6-bit DSCP value to its corresponding QoSClass.
+[[nodiscard]] QoSClass classify_dscp(std::uint8_t dscp) noexcept;
+
+/// Decode a data-plane PathMetrics::qos_class value (1..4 or raw DSCP) into a QoSClass.
+/// Returns std::nullopt when qos_class == 0 (unclassified).
+[[nodiscard]] std::optional<QoSClass> from_dp_qos_class(std::uint8_t qos_class) noexcept;
+
 /// Convert a packet-loss ratio in [0.0, 1.0] to parts-per-million [0, 1,000,000].
 std::uint32_t loss_ratio_to_ppm(double loss_ratio) noexcept;
 

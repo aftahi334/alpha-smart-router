@@ -95,3 +95,48 @@ TEST(QoSPolicy, ScoreAndChooseBest) {
       QoSClass::Realtime);
   EXPECT_FALSE(bad_loss.within_thresholds);
 }
+
+TEST(QoSPolicy, DscpClassificationAndLatencyAwareTieBreak) {
+  using namespace alpha::config::constants;
+  using alpha::routing::CandidateRef;
+  using alpha::routing::LatencyAwareConfig;
+  using alpha::routing::LatencyAwarePolicy;
+  using alpha::routing::MetricsSlot;
+  using alpha::routing::PacketContext;
+  using alpha::routing::from_dp_qos_class;
+  using alpha::routing::qos_match;
+  using alpha::routing::to_dp_qos_class;
+
+  EXPECT_FALSE(from_dp_qos_class(0).has_value());
+  EXPECT_FALSE(qos_match(0, DSCP_EF));
+  EXPECT_TRUE(qos_match(to_dp_qos_class(QoSClass::Realtime), DSCP_EF));
+  EXPECT_FALSE(qos_match(to_dp_qos_class(QoSClass::Bulk), DSCP_EF));
+  EXPECT_TRUE(qos_match(to_dp_qos_class(QoSClass::Interactive), DSCP_AF31));
+  EXPECT_TRUE(qos_match(DSCP_EF, DSCP_EF));
+
+  // Path 10 is slightly faster (1000 us) but tagged Bulk;
+  // Path 20 is within tie_margin_us (1150 us <= 1000 + 200) and tagged Realtime.
+  MetricsSlot bulk_slot, rt_slot;
+  alpha::routing::cp::update_metrics(bulk_slot, {
+    .rtt_us = 1000,
+    .qos_class = to_dp_qos_class(QoSClass::Bulk),
+    .healthy = true,
+  });
+  alpha::routing::cp::update_metrics(rt_slot, {
+    .rtt_us = 1150,
+    .qos_class = to_dp_qos_class(QoSClass::Realtime),
+    .healthy = true,
+  });
+
+  const CandidateRef cands[] = {
+    {.id = 10, .slot = &bulk_slot},
+    {.id = 20, .slot = &rt_slot},
+  };
+
+  LatencyAwarePolicy policy(LatencyAwareConfig{.tie_margin_us = 200, .prefer_qos_class = true});
+  // Realtime (EF) packet prefers Path 20 (Realtime class match) within tie margin
+  EXPECT_EQ(policy.choose(cands, PacketContext{.flow_hash = 1, .dscp = DSCP_EF}), 20u);
+  // Bulk (CS1) packet keeps Path 10 (Bulk class match + lower RTT)
+  EXPECT_EQ(policy.choose(cands, PacketContext{.flow_hash = 1, .dscp = DSCP_CS1}), 10u);
+}
+

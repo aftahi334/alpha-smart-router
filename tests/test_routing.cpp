@@ -22,8 +22,10 @@
 #include "alpha/routing/service_registry.hpp"
 
 using namespace std::chrono_literals;
+using alpha::routing::Limits;
 using alpha::routing::Pop;
 using alpha::routing::PopList;
+using alpha::routing::RegistryErr;
 using alpha::routing::ServiceRegistry;
 
 ///
@@ -60,7 +62,8 @@ TEST(ServiceRegistry, Registry_Add_And_Snapshot) {
   Pop b{.id="sfo", .region="us-west", .ip="198.51.100.20", .weight=100};
   PopList pops{a, b};
 
-  (void)reg.addService("svc1", as_span(pops));
+  ASSERT_EQ(reg.addService("svc1", as_span(pops)), RegistryErr::Ok);
+  EXPECT_EQ(reg.addService("svc1", as_span(pops)), RegistryErr::Exists);
 
   auto snap = reg.snapshot();
   ASSERT_TRUE(snap);
@@ -83,20 +86,42 @@ TEST(ServiceRegistry, Registry_Upsert_Idempotent) {
     Pop{.id="a2", .region="r1", .ip="203.0.113.2"},
   };
 
-  (void)reg.upsertService("svc", as_span(pops));
+  ASSERT_EQ(reg.upsertService("svc", as_span(pops)), RegistryErr::Ok);
   auto s1 = reg.snapshot();
   ASSERT_TRUE(s1);
   auto it1 = s1->find(std::string_view{"svc"});
   ASSERT_NE(it1, s1->end());
 
   // Upsert same content
-  (void)reg.upsertService("svc", as_span(pops));
+  ASSERT_EQ(reg.upsertService("svc", as_span(pops)), RegistryErr::Ok);
   auto s2 = reg.snapshot();
   ASSERT_TRUE(s2);
   auto it2 = s2->find(std::string_view{"svc"});
   ASSERT_NE(it2, s2->end());
 
   EXPECT_EQ(it1->second, it2->second);  // content equal (pointer identity not required)
+}
+
+/**
+ * @test Registry_Upsert_ReplacesExistingContent
+ * @brief Upserting an existing service replaces its PoP list.
+ */
+TEST(ServiceRegistry, Registry_Upsert_ReplacesExistingContent) {
+  ServiceRegistry reg;
+
+  PopList v1{
+    Pop{.id="nyc", .region="us-east", .ip="192.0.2.10"},
+    Pop{.id="bos", .region="us-east", .ip="192.0.2.11"},
+  };
+  PopList v2{
+    Pop{.id="sfo", .region="us-west", .ip="198.51.100.20"},
+  };
+
+  ASSERT_EQ(reg.upsertService("svc", as_span(v1)), RegistryErr::Ok);
+  EXPECT_EQ(reg.getPopsCopy("svc"), v1);
+
+  ASSERT_EQ(reg.upsertService("svc", as_span(v2)), RegistryErr::Ok);
+  EXPECT_EQ(reg.getPopsCopy("svc"), v2);
 }
 
 /**
@@ -109,7 +134,8 @@ TEST(ServiceRegistry, Registry_Replace_Content) {
   PopList v1{ Pop{.id="xx", .region="rx", .ip="203.0.113.10"} };
   PopList v2{ Pop{.id="yy", .region="ry", .ip="203.0.113.11"} };
 
-  (void)reg.addService("svc", as_span(v1));
+  EXPECT_EQ(reg.replaceService("svc", as_span(v1)), RegistryErr::NotFound);
+  ASSERT_EQ(reg.addService("svc", as_span(v1)), RegistryErr::Ok);
   {
     auto s = reg.snapshot();
     auto it = s->find(std::string_view{"svc"});
@@ -118,7 +144,7 @@ TEST(ServiceRegistry, Registry_Replace_Content) {
     EXPECT_EQ(it->second[0].id, "xx");
   }
 
-  (void)reg.replaceService("svc", as_span(v2));
+  ASSERT_EQ(reg.replaceService("svc", as_span(v2)), RegistryErr::Ok);
 
   auto s2 = reg.snapshot();
   auto it2 = s2->find(std::string_view{"svc"});
@@ -136,11 +162,12 @@ TEST(ServiceRegistry, Registry_Replace_Content) {
 TEST(ServiceRegistry, Registry_Remove_Existing) {
   ServiceRegistry reg;
 
-  PopList pops{ Pop{.id="pp", .region="r", .ip="203.0.113.3"} };
-  (void)reg.addService("svcX", as_span(pops));
+  PopList pops{ Pop{.id="pp", .region="r1", .ip="203.0.113.3"} };
+  ASSERT_EQ(reg.addService("svcX", as_span(pops)), RegistryErr::Ok);
+  ASSERT_TRUE(reg.hasService("svcX"));
 
   // remove and check
-  (void)reg.removeService("svcX");
+  EXPECT_TRUE(reg.removeService("svcX"));
   auto s = reg.snapshot();
   auto it = s->find(std::string_view{"svcX"});
   EXPECT_EQ(it, s->end());
@@ -155,7 +182,7 @@ TEST(ServiceRegistry, Registry_Remove_NotFound) {
 
   auto before = reg.snapshot();
   ASSERT_TRUE(before);
-  (void)reg.removeService("does_not_exist");
+  EXPECT_FALSE(reg.removeService("does_not_exist"));
   auto after = reg.snapshot();
   ASSERT_TRUE(after);
 
@@ -170,15 +197,93 @@ TEST(ServiceRegistry, Registry_Remove_NotFound) {
 TEST(ServiceRegistry, Registry_Clear) {
   ServiceRegistry reg;
 
-  PopList pops{ Pop{.id="p", .region="r", .ip="203.0.113.3"} };
-  (void)reg.addService("a", as_span(pops));
-  (void)reg.addService("b", as_span(pops));
+  PopList pops{ Pop{.id="p1", .region="r1", .ip="203.0.113.3"} };
+  ASSERT_EQ(reg.addService("s1", as_span(pops)), RegistryErr::Ok);
+  ASSERT_EQ(reg.addService("s2", as_span(pops)), RegistryErr::Ok);
+  ASSERT_EQ(reg.size(), 2u);
 
   reg.clear();
 
   auto s = reg.snapshot();
   ASSERT_TRUE(s);
   EXPECT_TRUE(s->empty());
+}
+
+/**
+ * @test Registry_Capacity_EnforcesMaxServicesAndAllowsUpdatesWhenFull
+ * @brief Capacity ceiling rejects a (MaxServices + 1)-th service while still
+ *        permitting Replace and Upsert on existing services.
+ */
+TEST(ServiceRegistry, Registry_Capacity_EnforcesMaxServicesAndAllowsUpdatesWhenFull) {
+  ServiceRegistry reg;
+  PopList v1{ Pop{.id="p1", .region="r1", .ip="192.0.2.1"} };
+  PopList v2{ Pop{.id="p2", .region="r2", .ip="192.0.2.2"} };
+
+  for (std::size_t i = 0; i < Limits::MaxServices; ++i) {
+    const std::string svc_id = "svc_" + std::to_string(i);
+    ASSERT_EQ(reg.addService(svc_id, as_span(v1)), RegistryErr::Ok);
+  }
+  ASSERT_EQ(reg.size(), Limits::MaxServices);
+
+  // Adding or upserting a new service beyond MaxServices must fail with Capacity
+  EXPECT_EQ(reg.addService("svc_overflow", as_span(v1)), RegistryErr::Capacity);
+  EXPECT_EQ(reg.upsertService("svc_overflow", as_span(v1)), RegistryErr::Capacity);
+  EXPECT_EQ(reg.size(), Limits::MaxServices);
+
+  // Updating an existing service when at MaxServices must still succeed
+  EXPECT_EQ(reg.replaceService("svc_0", as_span(v2)), RegistryErr::Ok);
+  EXPECT_EQ(reg.getPopsCopy("svc_0"), v2);
+
+  EXPECT_EQ(reg.upsertService("svc_1", as_span(v2)), RegistryErr::Ok);
+  EXPECT_EQ(reg.getPopsCopy("svc_1"), v2);
+  EXPECT_EQ(reg.size(), Limits::MaxServices);
+}
+
+/**
+ * @test Registry_StatsQueriesAndAdapters
+ * @brief Verifies stats(), version(), listServices(), and PopLike adapters.
+ */
+TEST(ServiceRegistry, Registry_StatsQueriesAndAdapters) {
+  struct CustomPop {
+    std::string id;
+    std::string region;
+    std::string ip;
+  };
+
+  ServiceRegistry reg;
+  const CustomPop cpops[] = {
+    {.id = "ny1", .region = "us-east", .ip = "192.0.2.10"},
+    {.id = "sf1", .region = "us-west", .ip = "198.51.100.20"},
+  };
+
+  EXPECT_TRUE(reg.addServiceBool<CustomPop>("svc_custom", std::span<const CustomPop>(cpops, 2)));
+  EXPECT_EQ(reg.version(), 1u);
+  EXPECT_TRUE(reg.hasService("svc_custom"));
+
+  auto converted = reg.getPopsAs<CustomPop>("svc_custom");
+  ASSERT_EQ(converted.size(), 2u);
+  EXPECT_EQ(converted[0].id, "ny1");
+  EXPECT_EQ(converted[1].id, "sf1");
+
+  const CustomPop cpops_updated[] = {
+    {.id = "fr1", .region = "eu-west", .ip = "203.0.113.50"},
+  };
+  EXPECT_EQ(reg.upsertService<CustomPop>("svc_custom", std::span<const CustomPop>(cpops_updated, 1)),
+            RegistryErr::Ok);
+  EXPECT_EQ(reg.replaceService<CustomPop>("svc_custom", std::span<const CustomPop>(cpops, 2)),
+            RegistryErr::Ok);
+
+  const auto svcs = reg.listServices();
+  ASSERT_EQ(svcs.size(), 1u);
+  EXPECT_EQ(svcs[0], "svc_custom");
+
+  EXPECT_TRUE(reg.removeService("svc_custom"));
+  const auto st = reg.stats();
+  EXPECT_EQ(st.adds, 1u);
+  EXPECT_EQ(st.upserts, 1u);
+  EXPECT_EQ(st.replaces, 1u);
+  EXPECT_EQ(st.removes, 1u);
+  EXPECT_EQ(st.failures, 0u);
 }
 
 // --------------------------- Concurrency sanity ----------------------------
@@ -218,12 +323,10 @@ TEST(ServiceRegistry, Registry_Concurrency_1W_MR) {
       if (!s) continue;
       auto it = s->find(std::string_view{"svc"});
       if (it != s->end()) {
-        const auto n = it->second.size();
-        // Must be exactly one of the published sizes; never torn
-        if (n == listA.size() || n == listB.size()) {
+        if (it->second == listA || it->second == listB) {
           ok_reads.fetch_add(1, std::memory_order_relaxed);
         } else {
-          ADD_FAILURE() << "Observed invalid size: " << n;
+          ADD_FAILURE() << "Observed invalid PoP list content (size=" << it->second.size() << ")";
           break;
         }
       }
@@ -236,6 +339,8 @@ TEST(ServiceRegistry, Registry_Concurrency_1W_MR) {
   r1.join(); r2.join(); r3.join();
 
   EXPECT_GT(ok_reads.load(), 0);
+  // Last iteration (i = 3999) is odd, so final published state must be listB
+  EXPECT_EQ(reg.getPopsCopy("svc"), listB);
 }
 
 // --------------------------- validation guard -------------------------------
@@ -407,9 +512,81 @@ TEST(PolicyBinding, PublishSelectAndClear) {
 
   const alpha::routing::PacketContext pkt{.flow_hash = 42, .dscp = 0};
   EXPECT_EQ(alpha::routing::dp::select_path(binding, cands, pkt), 20u);
+  const auto dec = alpha::routing::dp::select_path_decision(binding, cands, pkt);
+  EXPECT_TRUE(dec.forwarded());
+  EXPECT_EQ(dec.path_id, 20u);
+  EXPECT_EQ(dec.reason, alpha::routing::SelectReason::SelectedHealthy);
 
   alpha::routing::cp::clear_policy(binding);
   EXPECT_EQ(alpha::routing::dp::select_path(binding, cands, pkt), 0u);
+  const auto cleared_dec = alpha::routing::dp::select_path_decision(binding, cands, pkt);
+  EXPECT_FALSE(cleared_dec.forwarded());
+  EXPECT_EQ(cleared_dec.reason, alpha::routing::SelectReason::SnapshotUnavailable);
 }
+
+TEST(PathSelection, OutcomeReasonsAndExplicitDegradedPolicy) {
+  using alpha::routing::CandidateRef;
+  using alpha::routing::FlowHashPolicy;
+  using alpha::routing::LatencyAwareConfig;
+  using alpha::routing::LatencyAwarePolicy;
+  using alpha::routing::MetricsSlot;
+  using alpha::routing::PacketContext;
+  using alpha::routing::RoundRobinPolicy;
+  using alpha::routing::SelectReason;
+  using alpha::routing::kInvalidPathId;
+
+  const PacketContext pkt{.flow_hash = 7, .dscp = 0};
+  RoundRobinPolicy rr_allow(true);
+  RoundRobinPolicy rr_strict(false);
+  FlowHashPolicy fh_strict(/*skip_unhealthy=*/true, /*allow_degraded_fallback=*/false);
+  LatencyAwarePolicy la_strict(LatencyAwareConfig{.allow_degraded_fallback = false});
+
+  // 1. Empty candidate list -> NoCandidates
+  const std::span<const CandidateRef> empty_cands{};
+  const auto d_empty = rr_allow.choose_decision(empty_cands, pkt);
+  EXPECT_FALSE(d_empty.forwarded());
+  EXPECT_EQ(d_empty.path_id, kInvalidPathId);
+  EXPECT_EQ(d_empty.reason, SelectReason::NoCandidates);
+
+  // 2. Null / writer-locked slots -> SnapshotUnavailable
+  MetricsSlot locked_slot;
+  locked_slot.seq.store(1u, std::memory_order_relaxed); // odd = writer active
+  const CandidateRef unavailable_cands[] = {
+    {.id = 10, .slot = nullptr},
+    {.id = 20, .slot = &locked_slot},
+  };
+  const auto d_unavail = la_strict.choose_decision(unavailable_cands, pkt);
+  EXPECT_FALSE(d_unavail.forwarded());
+  EXPECT_EQ(d_unavail.path_id, kInvalidPathId);
+  EXPECT_EQ(d_unavail.reason, SelectReason::SnapshotUnavailable);
+
+  // 3. All readable paths unhealthy: DegradedFallback when allowed vs AllPathsUnhealthy when disabled
+  MetricsSlot down1, down2;
+  alpha::routing::cp::update_metrics(down1, {.rtt_us = 4000, .healthy = false});
+  alpha::routing::cp::update_metrics(down2, {.rtt_us = 1500, .healthy = false});
+  const CandidateRef unhealthy_cands[] = {
+    {.id = 10, .slot = &down1},
+    {.id = 20, .slot = &down2},
+  };
+
+  const auto d_degraded = rr_allow.choose_decision(unhealthy_cands, pkt);
+  EXPECT_TRUE(d_degraded.forwarded());
+  EXPECT_EQ(d_degraded.path_id, 10u);
+  EXPECT_EQ(d_degraded.reason, SelectReason::DegradedFallback);
+
+  const auto d_rr_reject = rr_strict.choose_decision(unhealthy_cands, pkt);
+  EXPECT_FALSE(d_rr_reject.forwarded());
+  EXPECT_EQ(d_rr_reject.path_id, kInvalidPathId);
+  EXPECT_EQ(d_rr_reject.reason, SelectReason::AllPathsUnhealthy);
+
+  const auto d_fh_reject = fh_strict.choose_decision(unhealthy_cands, pkt);
+  EXPECT_FALSE(d_fh_reject.forwarded());
+  EXPECT_EQ(d_fh_reject.reason, SelectReason::AllPathsUnhealthy);
+
+  const auto d_la_reject = la_strict.choose_decision(unhealthy_cands, pkt);
+  EXPECT_FALSE(d_la_reject.forwarded());
+  EXPECT_EQ(d_la_reject.reason, SelectReason::AllPathsUnhealthy);
+}
+
 
 

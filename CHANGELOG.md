@@ -5,29 +5,40 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.2.0] – Routing Semantics & Concurrency Hardening (October 2026)
+
+### Context
+Second milestone release building on the `v0.1.0` baseline.  
+Focus on hardening lock-free memory and seqlock primitives (`SpscQueue<T>`, `PacketPool`, `MetricsSlot`, `PolicyBinding`), separating Control Plane and Data Plane telemetry models, and completing deterministic ingress, QoS, and failover routing semantics.  
+See [docs/verification/verification_plan.md](docs/verification/verification_plan.md) for validated test coverage.
 
 ### Added
-- **Routing Core (`alpha::routing`)**
-  - Explicit Control Plane ↔ Data Plane metric conversion boundary (`loss_ratio_to_ppm`, `loss_ppm_to_ratio`, `to_dp_metrics`, `to_qos_metrics`) and `DpPathMetrics` alias.
-  - `jitter_us` field on data-plane `PathMetrics` and lock-free `MetricsSlot`.
-- **Unit Tests (`tests/`)**
-  - `tests/test_qos.cpp`: unit tests for `QoSPolicy` scoring, DSCP classification, threshold violations, and CP↔DP metric conversions.
-  - Concurrent 1-writer / multi-reader seqlock tests for `MetricsSlot` and publication tests for `PolicyBinding` in `tests/test_routing.cpp`.
-  - Non-trivial object lifetime, ring wrap-around, move-assignment, and capacity/overflow validation tests for `SpscQueue<T>` in `tests/test_mem.cpp`.
+- **Routing Core (`include/alpha/routing/`, `src/alpha/routing/`)**
+  - Explicit Control Plane (`QoSPathMetrics`) ↔ Data Plane (`PathMetrics` / `DpPathMetrics`) telemetry conversion boundary and `jitter_us` tracking.
+  - Deterministic `Flow5Tuple` and IPv4/IPv6 hashing (`HashSourceIP`, `Hash5Tuple`) in `IngressSelector`.
+  - Explicit data-plane `RouteDecision` and `SelectReason` outcomes (`SelectedHealthy`, `DegradedFallback`, `NoCandidates`, `AllPathsUnhealthy`, `SnapshotUnavailable`).
+  - DSCP-to-`QoSClass` classification (`classify_dscp`, `to_dp_qos_class`, `from_dp_qos_class`) wired into latency-aware path selection.
+  - `ServiceRegistry::stats()` observability counters and `PopLike` template adapters.
 
-### Changed
-- **Routing Core (`alpha::routing`)**
-  - Renamed the control-plane telemetry struct in `qos_policy.hpp` to `QoSPathMetrics` (`double loss` in `[0.0, 1.0]`) to eliminate the ODR/type collision with data-plane `PathMetrics` (`uint32_t loss_ppm` in `[0, 1'000'000]`).
+- **Documentation & Diagrams (`docs/`)**
+  - Added `cp_dp_concurrency.svg` and `routing_decision_flow.svg` (+ `.mmd` sources).
+  - Updated `architecture.svg`, `packet_flow.svg`, and `verification_plan.md` to reflect CP/DP separation and packet handle lifecycle.
+
+- **Unit Tests (`tests/`)**
+  - `test_qos.cpp`: `QoSPolicy` scoring, DSCP classification, and CP↔DP metric conversions.
+  - `test_ingress.cpp`: `RoundRobin`, `HashSourceIP`, `Hash5Tuple`, fallback handling, and `SimulatedBgpOracle`.
+  - `test_failover.cpp`: primary `recovery_hold_ms` hysteresis, selection dwell (`min_hold_ms`), and degraded path policies.
+  - Expanded `test_mem.cpp` and `test_routing.cpp` with object lifetime, bounds, concurrent seqlock, and RCU capacity tests (36 total test cases).
 
 ### Fixed
-- **Memory Layer (`alpha::mem`)**
-  - Fixed `SpscQueue<T>` object lifetime management to construct elements in-place via `std::construct_at`, destroy popped elements via `std::destroy_at`, and destroy remaining queued elements on destruction or move-assignment.
-  - Added capacity (`>= 2`, power-of-two), size multiplication overflow, and `std::nothrow` aligned allocation checks in `SpscQueue<T>::with_capacity` and `PacketPool`.
-  - Made `include/alpha/mem/packet.hpp` self-contained with `#pragma once`, `<cstddef>`, and `<cstdint>`.
-- **Concurrency & Seqlocks (`alpha::routing`)**
-  - Replaced non-atomic `MetricsSlot` payload with lock-free `std::atomic` fields and added writer-entry `release` and reader-exit `acquire` fences to `MetricsSlot` and `PolicyBinding`.
-  - Guarded path-selection policies against null `CandidateRef::slot` pointers and hardened `QoSPolicy::score_path` against negative or `NaN` packet loss inputs.
+- **Memory Primitives (`include/alpha/mem/`, `src/alpha/mem/`)**
+  - Explicit slot lifetime management (`std::construct_at` / `std::destroy_at`) and ring wrap-around cleanup in `SpscQueue<T>`.
+  - Power-of-two capacity (`>= 2`), size overflow, and `std::nothrow` allocation guards in `SpscQueue<T>` and `PacketPool`.
+
+- **Concurrency & Routing (`include/alpha/routing/`, `src/alpha/routing/`)**
+  - Atomic seqlock publication with release/acquire fences in `MetricsSlot` and `PolicyBinding` (eliminating torn reads).
+  - `ServiceRegistry` copy-on-write `upsertService` replacement, `Limits::MaxServices` capacity bound, and zero-allocation IP/PoP validators.
+  - `FailoverPolicy` primary `recovery_hold_ms` enforcement across all candidate branches and separation of selection dwell from health transition timestamps.
 
 ---
 

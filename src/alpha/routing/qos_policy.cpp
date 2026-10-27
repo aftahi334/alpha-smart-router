@@ -3,10 +3,36 @@
  * @brief Implementation of QoSPolicy scoring and DSCP lookup.
  */
 #include "alpha/routing/qos_policy.hpp"
+#include "alpha/config/constants.hpp"
 #include <algorithm>
 #include <utility>
 
 namespace alpha::routing {
+
+QoSClass classify_dscp(std::uint8_t dscp) noexcept {
+    using namespace alpha::config::constants;
+    // Realtime: EF (46)
+    if (dscp == DSCP_EF || dscp == 46u) {
+        return QoSClass::Realtime;
+    }
+    // Interactive: AF31/CS5 (0x28=40), RFC 2597 AF31 (26), CS4 (32), AF41 (34)
+    if (dscp == DSCP_AF31 || dscp == 26u || dscp == 32u || dscp == 34u || dscp == 40u) {
+        return QoSClass::Interactive;
+    }
+    // Bulk: CS1 (8), AF11 (10), AF21 (18)
+    if (dscp == DSCP_CS1 || dscp == 8u || dscp == 10u || dscp == 18u) {
+        return QoSClass::Bulk;
+    }
+    return QoSClass::BestEffort;
+}
+
+std::optional<QoSClass> from_dp_qos_class(std::uint8_t qos_class) noexcept {
+    if (qos_class == 0u) return std::nullopt;
+    if (qos_class >= 1u && qos_class <= 4u) {
+        return static_cast<QoSClass>(qos_class - 1u);
+    }
+    return classify_dscp(qos_class);
+}
 
 std::uint32_t loss_ratio_to_ppm(double loss_ratio) noexcept {
     if (!(loss_ratio > 0.0)) return 0u;

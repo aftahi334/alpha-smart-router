@@ -17,8 +17,29 @@
 
 namespace alpha::routing {
 
-/// Path identifier type (index into candidate set).
+/// Path identifier type (index/handle into candidate set; 0 denotes invalid/none).
 using PathId = std::uint32_t;
+inline constexpr PathId kInvalidPathId = 0;
+
+/// Explicit data-plane path selection outcome reason.
+enum class SelectReason : std::uint8_t {
+    SelectedHealthy = 0, ///< Healthy candidate selected normally
+    DegradedFallback,    ///< All candidates unhealthy; forwarded via degraded fallback policy
+    NoCandidates,        ///< Candidate list was empty (no route)
+    AllPathsUnhealthy,   ///< All readable candidates were unhealthy and degraded fallback is disabled
+    SnapshotUnavailable  ///< Candidate metric slots or policy binding could not be read
+};
+
+/// Result of a data-plane path selection decision.
+struct RouteDecision final {
+    PathId       path_id{kInvalidPathId};
+    SelectReason reason{SelectReason::NoCandidates};
+
+    [[nodiscard]] constexpr bool forwarded() const noexcept {
+        return reason == SelectReason::SelectedHealthy ||
+               reason == SelectReason::DegradedFallback;
+    }
+};
 
 /// Per-path metrics visible to data-plane policies (e.g., RTT, jitter, loss, health).
 struct PathMetrics final {
@@ -81,31 +102,45 @@ bool qos_match(std::uint8_t path_class, std::uint8_t dscp) noexcept;
 
 class RoundRobinPolicy final {
 public:
-    RoundRobinPolicy() = default;
+    explicit RoundRobinPolicy(bool allow_degraded_fallback = true) noexcept
+        : allow_degraded_fallback_(allow_degraded_fallback) {}
+
+    RouteDecision choose_decision(std::span<const CandidateRef> cands,
+                                  const PacketContext& pkt) noexcept;
     PathId choose(std::span<const CandidateRef> cands,
                   const PacketContext& pkt) noexcept;
 private:
     std::atomic<std::uint32_t> idx_{0};
+    bool allow_degraded_fallback_{true};
 };
 
 class FlowHashPolicy final {
 public:
-    explicit FlowHashPolicy(bool skip_unhealthy = true) noexcept;
+    explicit FlowHashPolicy(bool skip_unhealthy = true,
+                            bool allow_degraded_fallback = true) noexcept;
+
+    RouteDecision choose_decision(std::span<const CandidateRef> cands,
+                                  const PacketContext& pkt) noexcept;
     PathId choose(std::span<const CandidateRef> cands,
                   const PacketContext& pkt) noexcept;
 private:
     bool skip_unhealthy_;
+    bool allow_degraded_fallback_;
 };
 
 struct LatencyAwareConfig final {
     std::uint32_t tie_margin_us{200};
     std::uint32_t explore_ppm{0};
     bool prefer_qos_class{true};
+    bool allow_degraded_fallback{true};
 };
 
 class LatencyAwarePolicy final {
 public:
     explicit LatencyAwarePolicy(LatencyAwareConfig cfg = {}) noexcept;
+
+    RouteDecision choose_decision(std::span<const CandidateRef> cands,
+                                  const PacketContext& pkt) noexcept;
     PathId choose(std::span<const CandidateRef> cands,
                   const PacketContext& pkt) noexcept;
 private:
@@ -121,6 +156,13 @@ inline PathId select_path(Policy& policy,
                           std::span<const CandidateRef> cands,
                           const PacketContext& pkt) noexcept {
     return policy.choose(cands, pkt);
+}
+
+template <typename Policy>
+inline RouteDecision select_path_decision(Policy& policy,
+                                          std::span<const CandidateRef> cands,
+                                          const PacketContext& pkt) noexcept {
+    return policy.choose_decision(cands, pkt);
 }
 
 } // namespace alpha::routing
