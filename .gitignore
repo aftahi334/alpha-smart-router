@@ -86,7 +86,10 @@ Desktop.ini
 #/package-lock.json   # optional: keep if npm tooling used
 
 ########################
-# Editor backup files
+# Editor backup files & Local Planning Notes
 ########################
 *.save
+docs/completion_plan.md
+docs/completion-plan.md
+
 

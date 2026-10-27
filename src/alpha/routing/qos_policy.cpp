@@ -8,6 +8,43 @@
 
 namespace alpha::routing {
 
+std::uint32_t loss_ratio_to_ppm(double loss_ratio) noexcept {
+    if (!(loss_ratio > 0.0)) return 0u;
+    if (loss_ratio >= 1.0) return kMaxLossPpm;
+    return static_cast<std::uint32_t>(loss_ratio * static_cast<double>(kMaxLossPpm) + 0.5);
+}
+
+double loss_ppm_to_ratio(std::uint32_t loss_ppm) noexcept {
+    const auto clamped = std::min(loss_ppm, kMaxLossPpm);
+    return static_cast<double>(clamped) / static_cast<double>(kMaxLossPpm);
+}
+
+PathMetrics to_dp_metrics(
+    const QoSPathMetrics& src,
+    bool healthy,
+    std::uint8_t qos_class,
+    std::uint32_t avail_kbps,
+    std::uint32_t one_way_delay_us) noexcept {
+    return PathMetrics{
+        .rtt_us = src.latency_us,
+        .one_way_delay_us = one_way_delay_us,
+        .jitter_us = src.jitter_us,
+        .loss_ppm = loss_ratio_to_ppm(src.loss),
+        .avail_kbps = avail_kbps,
+        .qos_class = qos_class,
+        .healthy = healthy
+    };
+}
+
+QoSPathMetrics to_qos_metrics(std::string path_id, const PathMetrics& src) {
+    return QoSPathMetrics{
+        .path_id = std::move(path_id),
+        .latency_us = src.rtt_us,
+        .jitter_us = src.jitter_us,
+        .loss = loss_ppm_to_ratio(src.loss_ppm)
+    };
+}
+
 QoSPolicy::QoSPolicy(QoSConfig cfg) noexcept
     : cfg_(std::move(cfg)) {}
 
@@ -17,7 +54,7 @@ uint8_t QoSPolicy::dscp(QoSClass clazz) const noexcept {
     return it == cfg_.dscp_by_class.end() ? uint8_t{0} : it->second;
 }
 
-QoSScore QoSPolicy::score_path(const PathMetrics& pm, QoSClass clazz) const noexcept {
+QoSScore QoSPolicy::score_path(const QoSPathMetrics& pm, QoSClass clazz) const noexcept {
     QoSScore out{pm.path_id, 0.0, true};
 
     // Fetch thresholds for the class; fall back to conservative defaults.
@@ -25,22 +62,24 @@ QoSScore QoSPolicy::score_path(const PathMetrics& pm, QoSClass clazz) const noex
     const QoSThresholds th = (th_it == cfg_.thresholds_by_class.end())
         ? QoSThresholds{} : th_it->second;
 
+    const double sanitized_loss = (pm.loss >= 0.0 && pm.loss <= 1.0) ? pm.loss : 1.0;
+
     // Normalize each metric: ~1.0 means "meets target," <1.0 means "worse than target."
     const double nlat  = normalize_latency(pm.latency_us, th.max_latency_us);
     const double njit  = normalize_jitter(pm.jitter_us,   th.max_jitter_us);
-    const double nloss = normalize_loss(pm.loss,          th.max_loss);
+    const double nloss = normalize_loss(sanitized_loss,   th.max_loss);
 
     // Binary compliance flag (useful for strict modes or observability tags).
     out.within_thresholds = (pm.latency_us <= th.max_latency_us) &&
                             (pm.jitter_us  <= th.max_jitter_us) &&
-                            (pm.loss       <= th.max_loss);
+                            (pm.loss >= 0.0 && pm.loss <= th.max_loss);
 
     // Weighted blend into a single score; higher is better.
     out.score = blend(nlat, njit, nloss, cfg_.weights);
     return out;
 }
 
-std::optional<QoSScore> QoSPolicy::choose_best(const std::vector<PathMetrics>& candidates,
+std::optional<QoSScore> QoSPolicy::choose_best(const std::vector<QoSPathMetrics>& candidates,
                                                QoSClass clazz,
                                                bool require_within_thresholds) const noexcept {
     std::optional<QoSScore> best;

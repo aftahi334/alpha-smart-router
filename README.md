@@ -34,6 +34,10 @@ classDef inprog fill:#FFC107,stroke:#333,stroke-width:2px,color:#000;
 classDef future fill:#2196F3,stroke:#333,stroke-width:2px,color:#fff;
 ```
 
+- **Milestone 1–2 (Completed):** Lock-free `SpscQueue<T>` / `PacketPool` lifetime & bounds hardening, race-free `MetricsSlot` / `PolicyBinding` seqlocks, and unified CP (`QoSPathMetrics`) ↔ DP (`PathMetrics`) routing data model.
+- **Milestone 3 (Next):** Complete routing semantics (`ServiceRegistry` upsert/bounds, `IngressSelector` flow hashing, `FailoverPolicy` recovery hold timers) and unit tests (`test_ingress`, `test_failover`).
+- **Milestone 4–6 (Planned):** Config loading, observability counters/probes, and end-to-end `router_app` + `ping_tool` Linux pipeline.
+
 ## 🚦 Reliability Philosophy
 Routers never aim for **zero packet loss** — they aim for **loss under control**.
 - Data-plane level: bounded queues and fast failure signals (no unbounded latency).

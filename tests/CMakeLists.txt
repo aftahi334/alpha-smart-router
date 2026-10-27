@@ -3,6 +3,7 @@ find_package(GTest CONFIG REQUIRED)
 
 add_executable(test_routing
         ${CMAKE_CURRENT_LIST_DIR}/test_routing.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/test_qos.cpp
 )
 
 target_link_libraries(test_routing

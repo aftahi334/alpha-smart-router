@@ -16,6 +16,8 @@
 #include <string_view>
 #include <chrono>
 
+#include "alpha/routing/path_selection.hpp"
+#include "alpha/routing/policy_binding.hpp"
 #include "alpha/routing/pop.hpp"
 #include "alpha/routing/service_registry.hpp"
 
@@ -291,4 +293,123 @@ TEST(ServiceRegistry, Registry_Validation_Rejections_DoNotPublish) {
     EXPECT_EQ(it->second.size(), 2u);
   }
 }
+
+// --------------------------- MetricsSlot & PolicyBinding --------------------
+
+TEST(MetricsSlot, DefaultAndUpdateLoad) {
+  alpha::routing::MetricsSlot slot;
+  alpha::routing::PathMetrics out{};
+
+  ASSERT_TRUE(alpha::routing::dp::load_metrics(slot, out));
+  EXPECT_EQ(out.rtt_us, std::numeric_limits<std::uint32_t>::max());
+  EXPECT_EQ(out.one_way_delay_us, std::numeric_limits<std::uint32_t>::max());
+  EXPECT_EQ(out.jitter_us, 0u);
+  EXPECT_EQ(out.loss_ppm, 0u);
+  EXPECT_EQ(out.avail_kbps, 0u);
+  EXPECT_EQ(out.qos_class, 0u);
+  EXPECT_FALSE(out.healthy);
+
+  const alpha::routing::PathMetrics published{
+    .rtt_us = 1200,
+    .one_way_delay_us = 600,
+    .jitter_us = 150,
+    .loss_ppm = 250,
+    .avail_kbps = 100000,
+    .qos_class = 3,
+    .healthy = true
+  };
+  alpha::routing::cp::update_metrics(slot, published);
+
+  ASSERT_TRUE(alpha::routing::dp::load_metrics(slot, out));
+  EXPECT_EQ(out.rtt_us, 1200u);
+  EXPECT_EQ(out.one_way_delay_us, 600u);
+  EXPECT_EQ(out.jitter_us, 150u);
+  EXPECT_EQ(out.loss_ppm, 250u);
+  EXPECT_EQ(out.avail_kbps, 100000u);
+  EXPECT_EQ(out.qos_class, 3u);
+  EXPECT_TRUE(out.healthy);
+}
+
+TEST(MetricsSlot, Concurrent_1W_MR_NoTornReads) {
+  alpha::routing::MetricsSlot slot;
+  // Seed initial coherent state (v = 1)
+  alpha::routing::cp::update_metrics(slot, alpha::routing::PathMetrics{
+    .rtt_us = 1u,
+    .one_way_delay_us = 2u,
+    .jitter_us = 5u,
+    .loss_ppm = 3u,
+    .avail_kbps = 4u,
+    .qos_class = 1u,
+    .healthy = true
+  });
+
+  std::atomic<bool> running{true};
+  std::atomic<int> ok_reads{0};
+
+  std::thread writer([&] {
+    for (std::uint32_t v = 1; v <= 20000; ++v) {
+      alpha::routing::cp::update_metrics(slot, alpha::routing::PathMetrics{
+        .rtt_us = v,
+        .one_way_delay_us = v * 2u,
+        .jitter_us = v * 5u,
+        .loss_ppm = v * 3u,
+        .avail_kbps = v * 4u,
+        .qos_class = static_cast<std::uint8_t>(v & 0x7Fu),
+        .healthy = (v & 1u) != 0u
+      });
+    }
+    running.store(false, std::memory_order_relaxed);
+  });
+
+  auto reader_fn = [&] {
+    while (running.load(std::memory_order_relaxed)) {
+      alpha::routing::PathMetrics snap{};
+      if (alpha::routing::dp::load_metrics(slot, snap)) {
+        const std::uint32_t v = snap.rtt_us;
+        if (snap.one_way_delay_us == v * 2u &&
+            snap.jitter_us == v * 5u &&
+            snap.loss_ppm == v * 3u &&
+            snap.avail_kbps == v * 4u &&
+            snap.qos_class == static_cast<std::uint8_t>(v & 0x7Fu) &&
+            snap.healthy == ((v & 1u) != 0u)) {
+          ok_reads.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          ADD_FAILURE() << "Observed torn MetricsSlot snapshot for rtt_us=" << v;
+          break;
+        }
+      }
+    }
+  };
+
+  std::thread r1(reader_fn), r2(reader_fn), r3(reader_fn);
+  writer.join();
+  r1.join();
+  r2.join();
+  r3.join();
+
+  EXPECT_GT(ok_reads.load(), 0);
+}
+
+TEST(PolicyBinding, PublishSelectAndClear) {
+  alpha::routing::MetricsSlot s1, s2;
+  alpha::routing::cp::update_metrics(s1, {.rtt_us = 5000, .healthy = true});
+  alpha::routing::cp::update_metrics(s2, {.rtt_us = 1000, .healthy = true});
+
+  const alpha::routing::CandidateRef cands[] = {
+    {.id = 10, .slot = &s1},
+    {.id = 20, .slot = &s2},
+    {.id = 30, .slot = nullptr} // null slot must be safely ignored
+  };
+
+  alpha::routing::LatencyAwarePolicy policy;
+  alpha::routing::PolicyBinding binding;
+  alpha::routing::cp::publish_policy(binding, policy);
+
+  const alpha::routing::PacketContext pkt{.flow_hash = 42, .dscp = 0};
+  EXPECT_EQ(alpha::routing::dp::select_path(binding, cands, pkt), 20u);
+
+  alpha::routing::cp::clear_policy(binding);
+  EXPECT_EQ(alpha::routing::dp::select_path(binding, cands, pkt), 0u);
+}
+
 

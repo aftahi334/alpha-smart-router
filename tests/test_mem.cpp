@@ -11,6 +11,7 @@
 
 #include "alpha/mem/packet_pool.hpp"
 
+using alpha::mem::SpscError;
 using alpha::mem::SpscQueue;
 using alpha::mem::PacketPool;
 using alpha::mem::PacketHandle;
@@ -19,9 +20,33 @@ using alpha::mem::PacketHandle;
 
 TEST(SpscQueue, WithCapacity_Validation) {
   auto bad0 = SpscQueue<int>::with_capacity(0);
-  EXPECT_FALSE(bad0.has_value());
+  ASSERT_FALSE(bad0.has_value());
+  EXPECT_EQ(bad0.error(), SpscError::CapacityZero);
+
+  auto bad1 = SpscQueue<int>::with_capacity(1);
+  ASSERT_FALSE(bad1.has_value());
+  EXPECT_EQ(bad1.error(), SpscError::CapacityNotPowerOfTwo);
+
   auto badN = SpscQueue<int>::with_capacity(100);
-  EXPECT_FALSE(badN.has_value());
+  ASSERT_FALSE(badN.has_value());
+  EXPECT_EQ(badN.error(), SpscError::CapacityNotPowerOfTwo);
+
+  // Highest power-of-two size_t overflows when multiplied by sizeof(uint64_t).
+  constexpr std::size_t kMaxPow2 =
+      std::size_t{1} << (sizeof(std::size_t) * 8 - 1);
+  auto overflow = SpscQueue<std::uint64_t>::with_capacity(kMaxPow2);
+  ASSERT_FALSE(overflow.has_value());
+  EXPECT_EQ(overflow.error(), SpscError::AllocationFailed);
+
+  struct ThrowingMove {
+    ThrowingMove() = default;
+    ThrowingMove(ThrowingMove&&) noexcept(false) {}
+    ThrowingMove& operator=(ThrowingMove&&) noexcept(false) { return *this; }
+  };
+  auto badTrait = SpscQueue<ThrowingMove>::with_capacity(8);
+  ASSERT_FALSE(badTrait.has_value());
+  EXPECT_EQ(badTrait.error(), SpscError::ElementNotNothrowMovable);
+
   auto ok = SpscQueue<int>::with_capacity(1024);
   ASSERT_TRUE(ok);
   EXPECT_EQ(ok->capacity(), 1024u);
@@ -195,4 +220,95 @@ TEST(SpscQueue, MoveOnly_ProducerConsumer) {
   EXPECT_EQ(produced.load(), N);
   EXPECT_EQ(consumed.load(), N);
 }
+
+namespace {
+
+struct LifetimeTracker {
+  static constexpr std::uint32_t kAliveMagic = 0xC0FFEE01u;
+  static inline std::atomic<int> live_count{0};
+
+  std::uint32_t magic{kAliveMagic};
+  int value{0};
+
+  explicit LifetimeTracker(int v = 0) noexcept : value(v) {
+    live_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  LifetimeTracker(const LifetimeTracker& other) noexcept : value(other.value) {
+    EXPECT_EQ(other.magic, kAliveMagic);
+    live_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  LifetimeTracker(LifetimeTracker&& other) noexcept : value(other.value) {
+    EXPECT_EQ(other.magic, kAliveMagic);
+    other.value = -1;
+    live_count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  LifetimeTracker& operator=(const LifetimeTracker& other) noexcept {
+    EXPECT_EQ(magic, kAliveMagic);
+    EXPECT_EQ(other.magic, kAliveMagic);
+    value = other.value;
+    return *this;
+  }
+
+  LifetimeTracker& operator=(LifetimeTracker&& other) noexcept {
+    EXPECT_EQ(magic, kAliveMagic);
+    EXPECT_EQ(other.magic, kAliveMagic);
+    value = other.value;
+    other.value = -1;
+    return *this;
+  }
+
+  ~LifetimeTracker() noexcept {
+    EXPECT_EQ(magic, kAliveMagic);
+    magic = 0xDEADDEADu;
+    live_count.fetch_sub(1, std::memory_order_relaxed);
+  }
+};
+
+} // namespace
+
+TEST(SpscQueue, ObjectLifetime_WraparoundDestroyAndMoveAssign) {
+  LifetimeTracker::live_count.store(0, std::memory_order_relaxed);
+
+  {
+    auto qexp = SpscQueue<LifetimeTracker>::with_capacity(4);
+    ASSERT_TRUE(qexp);
+    auto q = std::move(*qexp);
+
+    // Fill 3 slots, pop 2, then push 2 more so live items wrap around the ring.
+    ASSERT_TRUE(q.push(LifetimeTracker{10}));
+    ASSERT_TRUE(q.push(LifetimeTracker{20}));
+    ASSERT_TRUE(q.push(LifetimeTracker{30}));
+    EXPECT_EQ(LifetimeTracker::live_count.load(), 3);
+
+    {
+      LifetimeTracker out{-1};
+      ASSERT_TRUE(q.pop(out));
+      EXPECT_EQ(out.value, 10);
+      ASSERT_TRUE(q.pop(out));
+      EXPECT_EQ(out.value, 20);
+    }
+    // Popped slots must be destroyed immediately.
+    EXPECT_EQ(LifetimeTracker::live_count.load(), 1);
+
+    ASSERT_TRUE(q.push(LifetimeTracker{40}));
+    ASSERT_TRUE(q.push(LifetimeTracker{50}));
+    EXPECT_EQ(LifetimeTracker::live_count.load(), 3);
+
+    // Move-assigning into a non-empty queue must destroy its existing live elements.
+    auto q2exp = SpscQueue<LifetimeTracker>::with_capacity(4);
+    ASSERT_TRUE(q2exp);
+    ASSERT_TRUE(q2exp->push(LifetimeTracker{99}));
+    EXPECT_EQ(LifetimeTracker::live_count.load(), 4);
+
+    *q2exp = std::move(q);
+    EXPECT_EQ(LifetimeTracker::live_count.load(), 3);
+  }
+
+  // Queue destruction must destroy all remaining wrapped elements.
+  EXPECT_EQ(LifetimeTracker::live_count.load(), 0);
+}
+
 

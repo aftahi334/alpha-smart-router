@@ -7,12 +7,18 @@
  */
 
 #include <cstdint>
-#include <string>
-#include <vector>
-#include <unordered_map>
+#include <limits>
 #include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "alpha/routing/path_selection.hpp"
 
 namespace alpha::routing {
+
+/// Parts-per-million scale factor for packet-loss conversion (1.0 == 1,000,000 ppm).
+inline constexpr std::uint32_t kMaxLossPpm = 1'000'000u;
 
 /**
  * @enum QoSClass
@@ -46,15 +52,32 @@ struct QoSWeights {
 };
 
 /**
- * @struct PathMetrics
- * @brief Snapshot of path health metrics supplied by the telemetry collector.
+ * @struct QoSPathMetrics
+ * @brief Control-plane snapshot of path health metrics supplied by telemetry.
  */
-struct PathMetrics {
-    std::string path_id;     ///< Stable identifier (e.g., "pop_sfo_primary")
-    uint32_t    latency_us{0}; ///< RTT or one-way; be consistent across the system
+struct QoSPathMetrics {
+    std::string path_id;       ///< Stable identifier (e.g., "pop_sfo_primary")
+    uint32_t    latency_us{0}; ///< RTT in microseconds
     uint32_t    jitter_us{0};  ///< Jitter in microseconds
     double      loss{0.0};     ///< Packet loss ratio [0.0, 1.0]
 };
+
+/// Convert a packet-loss ratio in [0.0, 1.0] to parts-per-million [0, 1,000,000].
+std::uint32_t loss_ratio_to_ppm(double loss_ratio) noexcept;
+
+/// Convert packet loss in parts-per-million [0, 1,000,000] to a ratio in [0.0, 1.0].
+double loss_ppm_to_ratio(std::uint32_t loss_ppm) noexcept;
+
+/// Convert control-plane QoSPathMetrics into compact data-plane PathMetrics.
+PathMetrics to_dp_metrics(
+    const QoSPathMetrics& src,
+    bool healthy,
+    std::uint8_t qos_class = 0,
+    std::uint32_t avail_kbps = 0,
+    std::uint32_t one_way_delay_us = std::numeric_limits<std::uint32_t>::max()) noexcept;
+
+/// Convert compact data-plane PathMetrics into control-plane QoSPathMetrics.
+QoSPathMetrics to_qos_metrics(std::string path_id, const PathMetrics& src);
 
 /**
  * @struct QoSScore
@@ -98,7 +121,7 @@ public:
      * @param clazz Traffic class whose thresholds apply.
      * @return Scoring result with compliance flag.
      */
-    QoSScore score_path(const PathMetrics& pm, QoSClass clazz) const noexcept;
+    QoSScore score_path(const QoSPathMetrics& pm, QoSClass clazz) const noexcept;
 
     /**
      * @brief Choose the best candidate among paths.
@@ -107,7 +130,7 @@ public:
      * @param require_within_thresholds If true, prefer only compliant paths; falls back to best overall if none.
      * @return The best score if candidates exist; std::nullopt otherwise.
      */
-    std::optional<QoSScore> choose_best(const std::vector<PathMetrics>& candidates,
+    std::optional<QoSScore> choose_best(const std::vector<QoSPathMetrics>& candidates,
                                         QoSClass clazz,
                                         bool require_within_thresholds = false) const noexcept;
 

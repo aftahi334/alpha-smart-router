@@ -15,20 +15,43 @@ struct XorShift32 {
 
 void cp::update_metrics(MetricsSlot& s, const PathMetrics& m) noexcept {
     const auto start = s.seq.load(std::memory_order_relaxed);
-    s.seq.store(start | 1u, std::memory_order_relaxed);      // writer enters
-    s.metrics = m;                                           // payload write
-    s.seq.store((start | 1u) + 1u, std::memory_order_release); // publish (even)
+    const auto odd   = start | 1u;
+    s.seq.store(odd, std::memory_order_relaxed); // writer enters (odd)
+    std::atomic_thread_fence(std::memory_order_release);
+
+    s.rtt_us.store(m.rtt_us, std::memory_order_relaxed);
+    s.one_way_delay_us.store(m.one_way_delay_us, std::memory_order_relaxed);
+    s.jitter_us.store(m.jitter_us, std::memory_order_relaxed);
+    s.loss_ppm.store(m.loss_ppm, std::memory_order_relaxed);
+    s.avail_kbps.store(m.avail_kbps, std::memory_order_relaxed);
+    s.qos_class.store(m.qos_class, std::memory_order_relaxed);
+    s.healthy.store(m.healthy, std::memory_order_relaxed);
+
+    s.seq.store(odd + 1u, std::memory_order_release); // publish (even)
 }
 
 bool dp::load_metrics(const MetricsSlot& s, PathMetrics& out) noexcept {
-    for (int i=0;i<4;++i) {
+    for (int i = 0; i < 4; ++i) {
         // Acquire pairs with writer's release; even => candidate stable snapshot.
         const auto s1 = s.seq.load(std::memory_order_acquire);
-        if (s1 & 1u) continue; // writer active
-        const PathMetrics snap = s.metrics;
-        // Recheck after reading payload: accept only if unchanged and even.
-        const auto s2 = s.seq.load(std::memory_order_acquire);
-        if (s1 == s2 && (s2 % 2u) == 0u) { out = snap; return true; }
+        if ((s1 & 1u) != 0u) continue; // writer active
+
+        PathMetrics snap{};
+        snap.rtt_us           = s.rtt_us.load(std::memory_order_relaxed);
+        snap.one_way_delay_us = s.one_way_delay_us.load(std::memory_order_relaxed);
+        snap.jitter_us        = s.jitter_us.load(std::memory_order_relaxed);
+        snap.loss_ppm         = s.loss_ppm.load(std::memory_order_relaxed);
+        snap.avail_kbps       = s.avail_kbps.load(std::memory_order_relaxed);
+        snap.qos_class        = s.qos_class.load(std::memory_order_relaxed);
+        snap.healthy          = s.healthy.load(std::memory_order_relaxed);
+
+        // Ensure relaxed payload loads complete before rechecking seq.
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const auto s2 = s.seq.load(std::memory_order_relaxed);
+        if (s1 == s2) {
+            out = snap;
+            return true;
+        }
     }
     return false;
 }
@@ -50,7 +73,7 @@ PathId RoundRobinPolicy::choose(std::span<const CandidateRef> cands,
     PathMetrics m{};
     for (std::uint32_t i=0;i<n;++i) {
         const auto k = (start + i) % n;
-        if (dp::load_metrics(*cands[k].slot, m) && m.healthy) return cands[k].id;
+        if (cands[k].slot && dp::load_metrics(*cands[k].slot, m) && m.healthy) return cands[k].id;
     }
     return cands[start].id; // degraded
 }
@@ -65,7 +88,7 @@ PathId FlowHashPolicy::choose(std::span<const CandidateRef> cands,
     PathMetrics m{};
     for (std::uint32_t i=0;i<n;++i) {
         const auto k = (base + i) % n;
-        if (dp::load_metrics(*cands[k].slot, m) && m.healthy) return cands[k].id;
+        if (cands[k].slot && dp::load_metrics(*cands[k].slot, m) && m.healthy) return cands[k].id;
     }
     return cands[base].id; // keep mapping stable if all unhealthy
 }
@@ -79,7 +102,7 @@ PathId LatencyAwarePolicy::choose(std::span<const CandidateRef> cands,
     // Min-RTT among healthy, QoS tie-break
     std::size_t best = 0; bool have_best=false; PathMetrics bestm{}; PathMetrics m{};
     for (std::size_t i=0;i<cands.size();++i) {
-        if (!dp::load_metrics(*cands[i].slot, m) || !m.healthy) continue;
+        if (!cands[i].slot || !dp::load_metrics(*cands[i].slot, m) || !m.healthy) continue;
         if (!have_best || m.rtt_us < bestm.rtt_us) { best=i; bestm=m; have_best=true; }
         else if (cfg_.prefer_qos_class) {
             const bool close = (m.rtt_us <= bestm.rtt_us + cfg_.tie_margin_us);
@@ -93,7 +116,7 @@ PathId LatencyAwarePolicy::choose(std::span<const CandidateRef> cands,
         // No healthy: pick absolute min RTT deterministically
         std::size_t idx=0; PathMetrics minm{}; bool init=false;
         for (std::size_t i=0;i<cands.size();++i) {
-            if (!dp::load_metrics(*cands[i].slot, m)) continue;
+            if (!cands[i].slot || !dp::load_metrics(*cands[i].slot, m)) continue;
             if (!init || m.rtt_us < minm.rtt_us) { idx=i; minm=m; init=true; }
         }
         return cands[init ? idx : 0].id;
@@ -107,7 +130,7 @@ PathId LatencyAwarePolicy::choose(std::span<const CandidateRef> cands,
             const auto start = rng.next_bounded(n);
             for (std::uint32_t i=0;i<n;++i) {
                 const auto k = (start + i) % n;
-                if (k != best && dp::load_metrics(*cands[k].slot, m) && m.healthy) {
+                if (k != best && cands[k].slot && dp::load_metrics(*cands[k].slot, m) && m.healthy) {
                     salt_.fetch_add(0x9E37u, std::memory_order_relaxed);
                     return cands[k].id;
                 }

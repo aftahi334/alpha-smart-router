@@ -20,19 +20,36 @@ namespace alpha::routing {
 /// Path identifier type (index into candidate set).
 using PathId = std::uint32_t;
 
-/// Per-path metrics visible to policies (e.g., RTT, health).
+/// Per-path metrics visible to data-plane policies (e.g., RTT, jitter, loss, health).
 struct PathMetrics final {
     std::uint32_t rtt_us{std::numeric_limits<std::uint32_t>::max()};
     std::uint32_t one_way_delay_us{std::numeric_limits<std::uint32_t>::max()};
+    std::uint32_t jitter_us{0};
     std::uint32_t loss_ppm{0};
     std::uint32_t avail_kbps{0};
     std::uint8_t  qos_class{0};
     bool          healthy{false};
 };
 
+/// Explicit alias distinguishing the data-plane metrics representation.
+using DpPathMetrics = PathMetrics;
+
 struct alignas(ALPHA_CACHELINE) MetricsSlot final {
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                  "std::atomic<uint32_t> must be lock-free on this target");
+    static_assert(std::atomic<std::uint8_t>::is_always_lock_free,
+                  "std::atomic<uint8_t> must be lock-free on this target");
+    static_assert(std::atomic<bool>::is_always_lock_free,
+                  "std::atomic<bool> must be lock-free on this target");
+
     std::atomic<std::uint32_t> seq{0}; // even=stable, odd=writer active
-    PathMetrics                metrics{};
+    std::atomic<std::uint32_t> rtt_us{std::numeric_limits<std::uint32_t>::max()};
+    std::atomic<std::uint32_t> one_way_delay_us{std::numeric_limits<std::uint32_t>::max()};
+    std::atomic<std::uint32_t> jitter_us{0};
+    std::atomic<std::uint32_t> loss_ppm{0};
+    std::atomic<std::uint32_t> avail_kbps{0};
+    std::atomic<std::uint8_t>  qos_class{0};
+    std::atomic<bool>          healthy{false};
 };
 
 /// Reference to a candidate path (id + pointer to metrics slot).

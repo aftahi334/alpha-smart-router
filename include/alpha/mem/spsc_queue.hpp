@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <new>
 #include <type_traits>
@@ -37,17 +38,18 @@ inline constexpr std::size_t kCacheLine = 64;
  */
 enum class SpscError : std::uint8_t {
   CapacityZero = 1,          ///< Capacity must not be zero
-  CapacityNotPowerOfTwo,     ///< Capacity must be power-of-two
-  AllocationFailed,          ///< Aligned allocation failed
-  ElementNotNothrowMovable   ///< T must be trivially copyable or nothrow-movable
+  CapacityNotPowerOfTwo,     ///< Capacity must be power-of-two (>= 2)
+  AllocationFailed,          ///< Aligned allocation failed or size overflowed
+  ElementNotNothrowMovable   ///< T must be trivially copyable or nothrow-movable/destructible
 };
 
 /// @brief Trait to constrain element types for RT-safety.
 template <class T>
 struct SpscTraits {
   static constexpr bool ok =
-    std::is_trivially_copyable_v<T> ||
-    std::is_nothrow_move_constructible_v<T>;
+    std::is_nothrow_move_constructible_v<T> &&
+    std::is_nothrow_move_assignable_v<T> &&
+    std::is_nothrow_destructible_v<T>;
 };
 
 /**
@@ -66,9 +68,12 @@ public:
   /// @brief Default-constructed empty shell (use with factory).
   SpscQueue() noexcept = default;
 
+  /// @brief Destroys any remaining queued elements and releases raw storage.
+  ~SpscQueue() noexcept { reset(); }
+
   /**
    * @brief Factory: validates input and allocates once (no exceptions).
-   * @param capacity_pow2 Ring capacity (must be power-of-two, >= 2 recommended).
+   * @param capacity_pow2 Ring capacity (must be power-of-two, >= 2).
    * @return expected<SpscQueue, SpscError> constructed queue or error.
    */
   static alpha_detail::expected<SpscQueue, SpscError>
@@ -76,28 +81,30 @@ public:
     if (capacity_pow2 == 0) {
       return alpha_detail::unexpected(SpscError::CapacityZero);
     }
-    if ((capacity_pow2 & (capacity_pow2 - 1)) != 0) {
+    if (capacity_pow2 < 2 || (capacity_pow2 & (capacity_pow2 - 1)) != 0) {
       return alpha_detail::unexpected(SpscError::CapacityNotPowerOfTwo);
     }
     if (!SpscTraits<T>::ok) {
       return alpha_detail::unexpected(SpscError::ElementNotNothrowMovable);
     }
+    if (capacity_pow2 > (std::numeric_limits<std::size_t>::max() / sizeof(T))) {
+      return alpha_detail::unexpected(SpscError::AllocationFailed);
+    }
 
-    // Allocate storage once, aligned for T. We do not value-initialize elements.
-    std::unique_ptr<T[], void(*)(T*)> storage(
-      static_cast<T*>(::operator new[](capacity_pow2 * sizeof(T),
-                                       std::align_val_t(alignof(T)))),
-      [](T* p){ ::operator delete[](p, std::align_val_t(alignof(T))); });
+    // Allocate raw storage once, aligned for T, without constructing elements.
+    T* raw = static_cast<T*>(
+      ::operator new[](capacity_pow2 * sizeof(T),
+                       std::align_val_t(alignof(T)),
+                       std::nothrow));
 
-    if (!storage) {
+    if (!raw) {
       return alpha_detail::unexpected(SpscError::AllocationFailed);
     }
 
     SpscQueue q;
-    q.buf_      = storage.get();
+    q.buf_      = raw;
     q.capacity_ = capacity_pow2;
     q.mask_     = capacity_pow2 - 1;
-    q.storage_  = std::move(storage);
     return q;
   }
 
@@ -115,23 +122,25 @@ public:
 
   /**
    * @brief Push by const reference.
-   * @param v Element to copy.
+   * @param v Element to copy-construct into the ring slot.
    * @return false if queue is full.
    */
-  bool push(const T& v) noexcept {
+  bool push(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>)
+    requires std::is_copy_constructible_v<T>
+  {
     const std::size_t t = tail_.load(std::memory_order_relaxed);
     const std::size_t n = (t + 1) & mask_;
     if (n == head_.load(std::memory_order_acquire)) {
       return false; // full
     }
-    buf_[t] = v;
+    std::construct_at(buf_ + t, v);
     tail_.store(n, std::memory_order_release);
     return true;
   }
 
   /**
    * @brief Push by rvalue reference.
-   * @param v Element to move.
+   * @param v Element to move-construct into the ring slot.
    * @return false if queue is full.
    */
   bool push(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) {
@@ -140,23 +149,27 @@ public:
     if (n == head_.load(std::memory_order_acquire)) {
       return false; // full
     }
-    buf_[t] = std::move(v);
+    std::construct_at(buf_ + t, std::move(v));
     tail_.store(n, std::memory_order_release);
     return true;
   }
 
   /**
-   * @brief Pop one element into output.
+   * @brief Pop one element into output and destroy the ring slot.
    * @param out Destination reference to receive the element.
    * @return false if queue is empty.
    */
-  bool pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T> ||
-                            std::is_trivially_copy_assignable_v<T>) {
+  bool pop(T& out) noexcept(
+    (std::is_nothrow_move_assignable_v<T> ||
+     std::is_trivially_copy_assignable_v<T>) &&
+    std::is_nothrow_destructible_v<T>)
+  {
     const std::size_t h = head_.load(std::memory_order_relaxed);
     if (h == tail_.load(std::memory_order_acquire)) {
       return false; // empty
     }
     out = std::move(buf_[h]);
+    std::destroy_at(buf_ + h);
     head_.store((h + 1) & mask_, std::memory_order_release);
     return true;
   }
@@ -184,28 +197,48 @@ public:
   }
 
 private:
+  /// @brief Destroy any live elements in [head_, tail_) and free raw storage.
+  void reset() noexcept {
+    if (!buf_) return;
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      std::size_t h = head_.load(std::memory_order_relaxed);
+      const std::size_t t = tail_.load(std::memory_order_relaxed);
+      while (h != t) {
+        std::destroy_at(buf_ + h);
+        h = (h + 1) & mask_;
+      }
+    }
+    ::operator delete[](buf_, std::align_val_t(alignof(T)));
+    buf_      = nullptr;
+    capacity_ = 0;
+    mask_     = 0;
+    head_.store(0, std::memory_order_relaxed);
+    tail_.store(0, std::memory_order_relaxed);
+  }
+
   /// @brief Helper to implement noexcept move.
   void move_from(SpscQueue&& other) noexcept {
+    reset();
     head_.store(other.head_.load(std::memory_order_relaxed), std::memory_order_relaxed);
     tail_.store(other.tail_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    buf_       = other.buf_;
-    capacity_  = other.capacity_;
-    mask_      = other.mask_;
-    storage_   = std::move(other.storage_);
-    other.buf_ = nullptr;
+    buf_            = other.buf_;
+    capacity_       = other.capacity_;
+    mask_           = other.mask_;
+    other.buf_      = nullptr;
     other.capacity_ = 0;
-    other.mask_ = 0;
+    other.mask_     = 0;
+    other.head_.store(0, std::memory_order_relaxed);
+    other.tail_.store(0, std::memory_order_relaxed);
   }
 
   // Producer/consumer indices on separate cache lines (avoid false sharing)
   alignas(kCacheLine) std::atomic<std::size_t> head_{0}; ///< Consumer index
   alignas(kCacheLine) std::atomic<std::size_t> tail_{0}; ///< Producer index
 
-  // Read-mostly metadata and owning storage
-  alignas(kCacheLine) T*                            buf_      = nullptr; ///< Non-owning view into storage_
-  std::size_t                                       capacity_ = 0;      ///< Capacity (power-of-two)
-  std::size_t                                       mask_     = 0;      ///< capacity_-1
-  std::unique_ptr<T[], void(*)(T*)>                 storage_{nullptr, +[](T*){}}; ///< Owning storage
+  // Read-mostly metadata and owning raw storage
+  alignas(kCacheLine) T*                       buf_      = nullptr; ///< Raw aligned buffer
+  std::size_t                                  capacity_ = 0;       ///< Capacity (power-of-two)
+  std::size_t                                  mask_     = 0;       ///< capacity_-1
 };
 
 } // namespace alpha::mem

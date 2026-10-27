@@ -42,10 +42,12 @@ namespace cp {
     template <typename Policy>
     inline void publish_policy(PolicyBinding& b, Policy& policy) noexcept {
         const auto start = b.seq.load(std::memory_order_relaxed);
-        b.seq.store(start | 1u, std::memory_order_relaxed);
+        const auto odd   = start | 1u;
+        b.seq.store(odd, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
         b.state.store(static_cast<void*>(&policy), std::memory_order_relaxed);
         b.fn.store(&detail::choose_thunk<Policy>, std::memory_order_relaxed);
-        b.seq.store((start | 1u) + 1u, std::memory_order_release);
+        b.seq.store(odd + 1u, std::memory_order_release);
     }
     void clear_policy(PolicyBinding& b) noexcept;
 }
